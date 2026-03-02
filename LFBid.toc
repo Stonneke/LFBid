@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: LF DKP Bid
+## Notes: Used for loot bidding
+## Author: LF Tent
+## Version: 1.0
+## SavedVariables: RaidMembersData, RaidTrackerMinimapButtonDB
+
+LFBid.lua
