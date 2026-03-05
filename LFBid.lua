@@ -9,8 +9,10 @@ local lfbid_openWindowOpen = false
 local lfbid_openType = "MS"
 local lfbid_openItemLink = ""
 local lfbid_biddingOpen = false
+local lfbid_bidMode = "points"
 local lfbid_whisperFrame
 local lfbid_bids = {}
+local lfbid_rollSeen = {}
 local LFBID_ADDON_PREFIX = "LFBid"
 
 print("LFBid loaded. Use /lfbid for commands.")
@@ -37,12 +39,36 @@ local function ParseBidMessage(msg, fallbackName)
     return finalName, points, spec
 end
 
+local function ParseSystemRollMessage(msg)
+    if not msg or msg == "" then
+        return nil, nil
+    end
+
+    local _, _, playerName, rollValue = string.find(msg, "^(.-) rolls (%d+) %(%d+%-%d+%)$")
+    if not playerName or not rollValue then
+        return nil, nil
+    end
+
+    local numericRoll = tonumber(rollValue)
+    if not numericRoll then
+        return nil, nil
+    end
+
+    return playerName, numericRoll
+end
+
 local function EscapeChatMessageText(message)
     return string.gsub(tostring(message or ""), "|", "||")
 end
 
 local function SendSafeChatMessage(message, chatType, language, target)
-    local safeMessage = EscapeChatMessageText(message)
+    local text = tostring(message or "")
+    local safeMessage
+    if string.find(text, "|Hitem:") then
+        safeMessage = text
+    else
+        safeMessage = EscapeChatMessageText(text)
+    end
     if safeMessage == "" then
         return
     end
@@ -133,6 +159,42 @@ local function SendBidMessageToLootMaster(msg, lootMasterName)
     end
 
     return false
+end
+
+local function GetCurrentLootMasterName()
+    if not GetLootMethod then
+        return nil
+    end
+
+    local method, partyMasterId, raidMasterId = GetLootMethod()
+    if method ~= "master" then
+        return nil
+    end
+
+    if raidMasterId ~= nil then
+        if raidMasterId == 0 then
+            return UnitName("player")
+        end
+        return UnitName("raid" .. tostring(raidMasterId))
+    end
+
+    if partyMasterId ~= nil then
+        if partyMasterId == 0 then
+            return UnitName("player")
+        end
+        return UnitName("party" .. tostring(partyMasterId))
+    end
+
+    return UnitName("player")
+end
+
+local function IsPlayerMasterLooter()
+    local myName = UnitName("player")
+    local lootMasterName = GetCurrentLootMasterName()
+    if not myName or not lootMasterName then
+        return false
+    end
+    return string.lower(tostring(myName)) == string.lower(tostring(lootMasterName))
 end
 
 local function SendBiddingStartMessage(itemLink)
@@ -262,23 +324,59 @@ local function StartLFBidMessageTimer(messages, intervalOrIntervals, onDone)
 end
 
 local function CloseBidding()
-    local firstMsg
-    if lfbid_activeItem then
-        firstMsg = "Closing bids on item " .. ItemTextForAnnouncement(lfbid_activeItem)
+    local messages
+    local intervals
+
+    if lfbid_bidMode == "roll" then
+        local itemText = lfbid_activeItem or "item"
+        local winnerName = nil
+        local winnerRoll = nil
+
+        for _, bid in ipairs(lfbid_bids) do
+            local bidRoll = tonumber(bid and bid.points) or 0
+            local bidName = tostring(bid and bid.name or "")
+
+            if not winnerName or bidRoll > winnerRoll or (bidRoll == winnerRoll and string.lower(bidName) < string.lower(winnerName)) then
+                winnerName = bidName
+                winnerRoll = bidRoll
+            end
+        end
+
+        local winnerMsg = "Winner: No valid rolls"
+        if winnerName and winnerName ~= "" and winnerRoll ~= nil then
+            winnerMsg = "Winner: " .. winnerName .. " with " .. tostring(winnerRoll)
+        end
+
+        messages = {
+            "Ending rolls for " .. itemText,
+            "3",
+            "2",
+            "1",
+            "Rolls have ended",
+            winnerMsg,
+        }
+        intervals = {1, 3, 1, 1, 1, 1}
     else
-        firstMsg = "Closing bids"
+        local firstMsg
+        if lfbid_activeItem then
+            firstMsg = "Closing bids on item " .. lfbid_activeItem
+        else
+            firstMsg = "Closing bids"
+        end
+
+        messages = {
+            firstMsg,
+            "3",
+            "2",
+            "1",
+            "Bids are now closed",
+        }
+        intervals = {1, 3, 1, 1, 1}
     end
 
-    local messages = {
-        firstMsg,
-        "3",
-        "2",
-        "1",
-        "Bids are now closed",
-    }
-
-    StartLFBidMessageTimer(messages, {1, 3, 1, 1, 1}, function()
+    StartLFBidMessageTimer(messages, intervals, function()
         lfbid_biddingOpen = false
+        lfbid_rollSeen = {}
         SendBiddingCloseMessage()
     end)
 end
@@ -286,6 +384,87 @@ end
 local function RefreshLFBidBidList()
     if not LFbidFrame or not LFbidFrame.gridCells then
         print("LFBid: Cannot refresh, frame or grid is nil")
+        return
+    end
+
+    if lfbid_bidMode == "roll" then
+        local specs = {"ROLLS"}
+        local grouped = {
+            ROLLS = {},
+        }
+
+        for _, bid in ipairs(lfbid_bids) do
+            if bid then
+                table.insert(grouped.ROLLS, bid)
+            end
+        end
+
+        table.sort(grouped.ROLLS, function(a, b)
+            local aRoll = tonumber(a and a.points) or 0
+            local bRoll = tonumber(b and b.points) or 0
+            if aRoll ~= bRoll then
+                return aRoll > bRoll
+            end
+            local aName = string.lower(tostring(a and a.name or ""))
+            local bName = string.lower(tostring(b and b.name or ""))
+            return aName < bName
+        end)
+
+        local neededCells = 1
+        local colWidth = 410
+        local cellGapY = 8
+        local startX = 10
+        local startY = -58
+
+        local cell = LFbidFrame.gridCells[1]
+        if not cell then
+            cell = CreateFrame("Frame", nil, LFbidFrame)
+            cell:SetWidth(colWidth)
+            cell:SetHeight(100)
+            cell:SetBackdrop({
+                bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                tile = true, tileSize = 16, edgeSize = 12,
+                insets = { left = 3, right = 3, top = 3, bottom = 3 }
+            })
+            cell:SetBackdropColor(0, 0, 0, 0.2)
+
+            cell.label = cell:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            cell.label:SetPoint("TOPLEFT", cell, "TOPLEFT", 8, -8)
+            cell.label:SetJustifyH("LEFT")
+
+            cell.text = cell:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            cell.text:SetPoint("TOPLEFT", cell.label, "BOTTOMLEFT", 0, -2)
+            cell.text:SetWidth(colWidth - 16)
+            cell.text:SetJustifyH("LEFT")
+
+            LFbidFrame.gridCells[1] = cell
+        end
+
+        cell:ClearAllPoints()
+        cell:SetPoint("TOPLEFT", LFbidFrame, "TOPLEFT", startX, startY)
+
+        local lines = {}
+        for _, bid in ipairs(grouped.ROLLS) do
+            table.insert(lines, tostring(bid.name or "") .. " - " .. tostring(bid.points or ""))
+        end
+        if table.getn(lines) == 0 then
+            lines[1] = "-"
+        end
+
+        cell.label:SetText(specs[1])
+        cell.text:SetText(table.concat(lines, "\n"))
+        cell:Show()
+
+        local existingCells = table.getn(LFbidFrame.gridCells)
+        for index = neededCells + 1, existingCells do
+            local extraCell = LFbidFrame.gridCells[index]
+            if extraCell then
+                extraCell:Hide()
+            end
+        end
+
+        LFbidFrame:SetHeight(198 + cellGapY)
         return
     end
 
@@ -609,7 +788,7 @@ local function OpenLFBidOpenWindow()
     lfbid_openFrame:Show()
 end
 
-local function OpenLFBidWindow(itemLink)
+local function OpenLFBidWindow(itemLink, bidMode)
     -- create the frame only once
     if not LFbidFrame then
         LFbidFrame = CreateFrame("Frame", "LFbidFrame", UIParent)
@@ -688,7 +867,9 @@ local function OpenLFBidWindow(itemLink)
             LFbidFrame.itemLinkButton:EnableMouse(false)
         end
     end
+    lfbid_bidMode = bidMode or "points"
     lfbid_bids = {}
+    lfbid_rollSeen = {}
     RefreshLFBidBidList()
     lfbid_windowOpen = true
     LFbidFrame:Show()
@@ -715,15 +896,49 @@ if not lfbid_whisperFrame then
     lfbid_whisperFrame = CreateFrame("Frame")
     lfbid_whisperFrame:RegisterEvent("CHAT_MSG_WHISPER")
     lfbid_whisperFrame:RegisterEvent("CHAT_MSG_ADDON")
+    lfbid_whisperFrame:RegisterEvent("CHAT_MSG_SYSTEM")
     lfbid_whisperFrame:SetScript("OnEvent", function(_, eventName, p1, p2, p3, p4)
         if not lfbid_windowOpen then
+            return
+        end
+
+        local evt = eventName or event
+        if evt == "CHAT_MSG_SYSTEM" then
+            if not lfbid_biddingOpen or lfbid_bidMode ~= "roll" then
+                return
+            end
+
+            local rollName, rollValue = ParseSystemRollMessage(p1 or arg1)
+            if not rollName or rollValue == nil then
+                return
+            end
+
+            local rollKey = string.lower(tostring(rollName))
+            if lfbid_rollSeen[rollKey] then
+                return
+            end
+
+            lfbid_rollSeen[rollKey] = true
+            table.insert(lfbid_bids, {
+                name = rollName,
+                points = rollValue,
+                spec = "ROLL",
+            })
+            RefreshLFBidBidList()
+            return
+        end
+
+        if not lfbid_biddingOpen then
+            return
+        end
+
+        if lfbid_bidMode == "roll" then
             return
         end
 
         local msg
         local sender
         local sourceType = "whisper"
-        local evt = eventName or event
 
         if evt == "CHAT_MSG_ADDON" then
             local prefix = p1 or arg1
@@ -835,6 +1050,10 @@ local function HandleLFBidSlash(msg)
     end
 
     if cmd == "start" then
+        if not IsPlayerMasterLooter() then
+            print("LFBid: /lfbid start and /lfbid roll are only available to the Master Looter.")
+            return
+        end
         if rest == "" then
             print("Usage: /lfbid start <itemlink>")
             return
@@ -846,9 +1065,31 @@ local function HandleLFBidSlash(msg)
         lfbid_activeItem = rest
         lfbid_openItemLink = rest
         lfbid_biddingOpen = true
+        lfbid_bidMode = "points"
         SendBiddingStartMessage(rest)
-        SendSafeChatMessage("Start bidding on item: " .. ItemTextForAnnouncement(rest), "RAID_WARNING")
-        OpenLFBidWindow(rest)
+        SendSafeChatMessage("Start bidding on item: " .. rest, "RAID_WARNING")
+        OpenLFBidWindow(rest, "points")
+    elseif cmd == "roll" then
+        if not IsPlayerMasterLooter() then
+            print("LFBid: /lfbid start and /lfbid roll are only available to the Master Looter.")
+            return
+        end
+        if rest == "" then
+            print("Usage: /lfbid roll <itemlink>")
+            return
+        end
+        if lfbid_windowOpen then
+            print("Bidding window already open. Close it first with the X button.")
+            return
+        end
+
+        lfbid_activeItem = rest
+        lfbid_openItemLink = ""
+        lfbid_biddingOpen = true
+        lfbid_bidMode = "roll"
+        lfbid_rollSeen = {}
+        SendSafeChatMessage("Start rolling for item: " .. rest, "RAID_WARNING")
+        OpenLFBidWindow(rest, "roll")
     elseif cmd == "open" then
         if lfbid_openWindowOpen then
             print("LFBid open window already open.")
@@ -856,7 +1097,7 @@ local function HandleLFBidSlash(msg)
         end
         OpenLFBidOpenWindow()
     else
-        print("LFbid commands:\n  /lfbid start <itemlink>\n  /lfbid open")
+        print("LFbid commands:\n  /lfbid start <itemlink>\n  /lfbid roll <itemlink>\n  /lfbid open")
     end
 end
 
