@@ -14,6 +14,19 @@ local lfbid_whisperFrame
 local lfbid_bids = {}
 local lfbid_rollSeen = {}
 local LFBID_ADDON_PREFIX = "LFBid"
+local LFDKP_ADDON_PREFIX = "LFDKP"
+local lfbid_backdropAlpha = 0.30
+local lfbid_useDKPCheck = 1
+local RefreshMasterLootButtons
+
+local function ApplyLFBidBackdropAlpha()
+    if LFbidFrame then
+        LFbidFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+    end
+    if lfbid_openFrame then
+        lfbid_openFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+    end
+end
 
 print("LFBid loaded. Use /lfbid for commands.")
 
@@ -259,6 +272,134 @@ local function NormalizeSpec(spec)
     return string.upper(first) .. string.lower(rest)
 end
 
+local function FindDKPPlayerKey(playerName)
+    if type(LFTentDKP) ~= "table" then
+        return nil
+    end
+
+    local name = tostring(playerName or "")
+    if name == "" then
+        return nil
+    end
+
+    if LFTentDKP[name] ~= nil then
+        return name
+    end
+
+    local target = string.lower(name)
+    for key, _ in pairs(LFTentDKP) do
+        if string.lower(tostring(key)) == target then
+            return key
+        end
+    end
+
+    return nil
+end
+
+local function GetPlayerDKPInfo(playerName)
+    local dkpKey = FindDKPPlayerKey(playerName)
+    if not dkpKey then
+        return nil, false
+    end
+    return tonumber(LFTentDKP[dkpKey]), true
+end
+
+local function ParseDKPDeltaMessage(msg)
+    local text = tostring(msg or "")
+    if text == "" then
+        return nil, nil
+    end
+
+    text = string.gsub(text, "^%s+", "")
+    text = string.gsub(text, "%s+$", "")
+    if text == "" then
+        return nil, nil
+    end
+
+    local lower = string.lower(text)
+    if string.sub(lower, 1, 4) == "dkp " then
+        text = string.sub(text, 5)
+    elseif string.sub(lower, 1, 4) == "dkp:" then
+        text = string.sub(text, 5)
+    end
+
+    -- Accept payloads from LFDKP like "Alice +1 points".
+    text = string.gsub(text, "%s+[Pp][Oo][Ii][Nn][Tt][Ss]?$", "")
+
+    local _, _, name, sign, amount = string.find(text, "^(%S+)%s*([%+%-])%s*(%d+)$")
+    if name and sign and amount then
+        local delta = tonumber(amount)
+        if not delta then
+            return nil, nil
+        end
+        if sign == "-" then
+            delta = -delta
+        end
+        return name, delta
+    end
+
+    local _, _, compactName, signedNumber = string.find(text, "^(%S+)%s+([%+%-]%d+)$")
+    if compactName and signedNumber then
+        return compactName, tonumber(signedNumber)
+    end
+
+    return nil, nil
+end
+
+local function ApplyDKPDelta(playerName, delta)
+    if not playerName or playerName == "" or type(delta) ~= "number" then
+        return false
+    end
+
+    if type(LFTentDKP) ~= "table" then
+        LFTentDKP = {}
+    end
+
+    local key = FindDKPPlayerKey(playerName)
+    if not key then
+        key = tostring(playerName)
+    end
+
+    local oldPoints = tonumber(LFTentDKP[key]) or 0
+    local newPoints = oldPoints + delta
+    LFTentDKP[key] = newPoints
+
+    print("LFBid: DKP updated for " .. key .. ": " .. oldPoints .. " -> " .. newPoints)
+    return true
+end
+
+local function BidHasEnoughDKP(bid)
+    if not lfbid_useDKPCheck then
+        return true
+    end
+
+    local bidPoints = tonumber(bid and bid.points)
+    if not bidPoints then
+        return true
+    end
+
+    local playerDKP = GetPlayerDKPInfo(bid and bid.name)
+    if not playerDKP then
+        playerDKP = 0
+    end
+
+    return playerDKP >= bidPoints
+end
+
+local function IsUnknownZeroBid(bid)
+    if not lfbid_useDKPCheck then
+        return false
+    end
+
+    local bidPoints = tonumber(bid and bid.points)
+    if bidPoints ~= 0 then
+        return false
+    end
+
+    local _, isKnownPlayer = GetPlayerDKPInfo(bid and bid.name)
+    return not isKnownPlayer
+end
+
 local function RemoveExistingBidForPlayer(playerName)
     if not playerName or playerName == "" then
         return
@@ -308,7 +449,7 @@ local function StartLFBidMessageTimer(messages, intervalOrIntervals, onDone)
 
         local msg = lfbid_timerFrame.messages[lfbid_timerFrame.index]
         if msg then
-            SendSafeChatMessage(msg, "RAID_WARNING")
+            SendSafeChatMessage(msg, "RAID")
             lfbid_timerFrame.index = lfbid_timerFrame.index + 1
             return
         end
@@ -324,6 +465,11 @@ local function StartLFBidMessageTimer(messages, intervalOrIntervals, onDone)
 end
 
 local function CloseBidding()
+    if not lfbid_biddingOpen then
+        print("LFBid: Bidding is not active.")
+        return
+    end
+
     local messages
     local intervals
 
@@ -378,7 +524,64 @@ local function CloseBidding()
         lfbid_biddingOpen = false
         lfbid_rollSeen = {}
         SendBiddingCloseMessage()
+        if RefreshMasterLootButtons then
+            RefreshMasterLootButtons()
+        end
     end)
+end
+
+local function StartPointsBiddingFromMasterWindow()
+    if lfbid_bidMode ~= "points" then
+        return
+    end
+
+    if lfbid_biddingOpen then
+        print("LFBid: Bidding is already active.")
+        return
+    end
+
+    if not lfbid_activeItem or lfbid_activeItem == "" then
+        print("LFBid: No active item set.")
+        return
+    end
+
+    lfbid_openItemLink = lfbid_activeItem
+    lfbid_biddingOpen = true
+    SendBiddingStartMessage(lfbid_activeItem)
+    SendSafeChatMessage("Start bidding on item: " .. lfbid_activeItem, "RAID")
+
+    if RefreshMasterLootButtons then
+        RefreshMasterLootButtons()
+    end
+end
+
+RefreshMasterLootButtons = function()
+    if not LFbidFrame then
+        return
+    end
+
+    if LFbidFrame.startBtn then
+        if lfbid_bidMode == "points" then
+            LFbidFrame.startBtn:Show()
+            if lfbid_biddingOpen then
+                LFbidFrame.startBtn:SetText("Started")
+                LFbidFrame.startBtn:Disable()
+            else
+                LFbidFrame.startBtn:SetText("Start Bid")
+                LFbidFrame.startBtn:Enable()
+            end
+        else
+            LFbidFrame.startBtn:Hide()
+        end
+    end
+
+    if LFbidFrame.stopBtn then
+        if lfbid_biddingOpen then
+            LFbidFrame.stopBtn:Enable()
+        else
+            LFbidFrame.stopBtn:Disable()
+        end
+    end
 end
 
 local function RefreshLFBidBidList()
@@ -568,7 +771,15 @@ local function RefreshLFBidBidList()
         local lines = {}
         local bidList = grouped[spec] or {}
         for _, bid in ipairs(bidList) do
-            table.insert(lines, tostring(bid.points or "") .. " -- " .. tostring(bid.name or ""))
+            local pointsText = tostring(bid.points or "")
+            local nameText = tostring(bid.name or "")
+            if IsUnknownZeroBid(bid) then
+                nameText = "|cff33aaff" .. nameText .. "|r"
+            elseif not BidHasEnoughDKP(bid) then
+                nameText = "|cffff2020" .. nameText .. "|r"
+            end
+            local line = pointsText .. " -- " .. nameText
+            table.insert(lines, line)
         end
         if table.getn(lines) == 0 then
             lines[1] = "-"
@@ -639,7 +850,7 @@ local function OpenLFBidOpenWindow()
             tile = true, tileSize = 16, edgeSize = 16,
             insets = { left = 4, right = 4, top = 4, bottom = 4 }
         })
-        lfbid_openFrame:SetBackdropColor(0, 0, 0, 0.3)
+        lfbid_openFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
         lfbid_openFrame:EnableMouse(true)
         lfbid_openFrame:SetMovable(true)
         lfbid_openFrame:RegisterForDrag("LeftButton")
@@ -651,8 +862,35 @@ local function OpenLFBidOpenWindow()
         end)
 
         lfbid_openFrame.title = lfbid_openFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        lfbid_openFrame.title:SetPoint("TOPLEFT", lfbid_openFrame, "TOPLEFT", 10, -8)
+        lfbid_openFrame.title:SetPoint("TOPLEFT", lfbid_openFrame, "TOPLEFT", 10, -14)
         lfbid_openFrame.title:SetText("LF Tent Bidding")
+
+        lfbid_openFrame.alphaSlider = CreateFrame("Slider", "LFBidOpenAlphaSlider", lfbid_openFrame, "OptionsSliderTemplate")
+        lfbid_openFrame.alphaSlider:SetWidth(120)
+        lfbid_openFrame.alphaSlider:SetHeight(14)
+        lfbid_openFrame.alphaSlider:SetPoint("TOPLEFT", lfbid_openFrame, "TOPLEFT", 150, -16)
+        lfbid_openFrame.alphaSlider:SetMinMaxValues(0.05, 0.90)
+        lfbid_openFrame.alphaSlider:SetValueStep(0.05)
+        lfbid_openFrame.alphaSlider:SetValue(lfbid_backdropAlpha)
+        lfbid_openFrame.alphaSlider:SetScript("OnValueChanged", function()
+            local value = arg1
+            if not value and this and this.GetValue then
+                value = this:GetValue()
+            end
+            if value then
+                lfbid_backdropAlpha = value
+                ApplyLFBidBackdropAlpha()
+            end
+        end)
+        if getglobal("LFBidOpenAlphaSliderText") then
+            getglobal("LFBidOpenAlphaSliderText"):SetText("Background")
+        end
+        if getglobal("LFBidOpenAlphaSliderLow") then
+            getglobal("LFBidOpenAlphaSliderLow"):SetText("5%")
+        end
+        if getglobal("LFBidOpenAlphaSliderHigh") then
+            getglobal("LFBidOpenAlphaSliderHigh"):SetText("90%")
+        end
 
         lfbid_openFrame.pointsLabel = lfbid_openFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         lfbid_openFrame.pointsLabel:SetPoint("TOPLEFT", lfbid_openFrame, "TOPLEFT", 10, -58)
@@ -784,6 +1022,10 @@ local function OpenLFBidOpenWindow()
             end
         end
     end
+    if lfbid_openFrame.alphaSlider then
+        lfbid_openFrame.alphaSlider:SetValue(lfbid_backdropAlpha)
+    end
+    ApplyLFBidBackdropAlpha()
     lfbid_openWindowOpen = true
     lfbid_openFrame:Show()
 end
@@ -801,7 +1043,7 @@ local function OpenLFBidWindow(itemLink, bidMode)
             tile = true, tileSize = 16, edgeSize = 16,
             insets = { left = 4, right = 4, top = 4, bottom = 4 }
         })
-        LFbidFrame:SetBackdropColor(0, 0, 0, 0.3)
+        LFbidFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
         LFbidFrame:EnableMouse(true)
         LFbidFrame:SetMovable(true)
         LFbidFrame:RegisterForDrag("LeftButton")
@@ -813,25 +1055,76 @@ local function OpenLFBidWindow(itemLink, bidMode)
             LFbidFrame:StopMovingOrSizing()
         end)
 
+        LFbidFrame.alphaSlider = CreateFrame("Slider", "LFBidMasterAlphaSlider", LFbidFrame, "OptionsSliderTemplate")
+        LFbidFrame.alphaSlider:SetWidth(130)
+        LFbidFrame.alphaSlider:SetHeight(14)
+        LFbidFrame.alphaSlider:SetPoint("TOPLEFT", LFbidFrame, "TOPLEFT", 12, -16)
+        LFbidFrame.alphaSlider:SetMinMaxValues(0.05, 0.90)
+        LFbidFrame.alphaSlider:SetValueStep(0.05)
+        LFbidFrame.alphaSlider:SetValue(lfbid_backdropAlpha)
+        LFbidFrame.alphaSlider:SetScript("OnValueChanged", function()
+            local value = arg1
+            if not value and this and this.GetValue then
+                value = this:GetValue()
+            end
+            if value then
+                lfbid_backdropAlpha = value
+                ApplyLFBidBackdropAlpha()
+            end
+        end)
+        if getglobal("LFBidMasterAlphaSliderText") then
+            getglobal("LFBidMasterAlphaSliderText"):SetText("Background")
+        end
+        if getglobal("LFBidMasterAlphaSliderLow") then
+            getglobal("LFBidMasterAlphaSliderLow"):SetText("5%")
+        end
+        if getglobal("LFBidMasterAlphaSliderHigh") then
+            getglobal("LFBidMasterAlphaSliderHigh"):SetText("90%")
+        end
+
+        LFbidFrame.startBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
+        LFbidFrame.startBtn:SetWidth(90)
+        LFbidFrame.startBtn:SetHeight(24)
+        LFbidFrame.startBtn:SetPoint("TOP", LFbidFrame, "TOP", -48, -6)
+        LFbidFrame.startBtn:SetText("Start Bid")
+        LFbidFrame.startBtn:SetScript("OnClick", function()
+            StartPointsBiddingFromMasterWindow()
+        end)
+
         -- Stop Bids button (top center)
         LFbidFrame.stopBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
-        LFbidFrame.stopBtn:SetWidth(100)
+        LFbidFrame.stopBtn:SetWidth(90)
         LFbidFrame.stopBtn:SetHeight(24)
-        LFbidFrame.stopBtn:SetPoint("TOP", LFbidFrame, "TOP", 0, -5)
+        LFbidFrame.stopBtn:SetPoint("TOP", LFbidFrame, "TOP", 48, -6)
         LFbidFrame.stopBtn:SetText("Stop Bids")
             LFbidFrame.stopBtn:SetScript("OnClick", function()
                 CloseBidding()
             end)
 
+        LFbidFrame.dkpCheckBox = CreateFrame("CheckButton", "LFBidUseDKPCheckBox", LFbidFrame, "UICheckButtonTemplate")
+        LFbidFrame.dkpCheckBox:SetWidth(24)
+        LFbidFrame.dkpCheckBox:SetHeight(24)
+        LFbidFrame.dkpCheckBox:SetPoint("TOPRIGHT", LFbidFrame, "TOPRIGHT", -28, -8)
+        LFbidFrame.dkpCheckBox:SetChecked(lfbid_useDKPCheck)
+        LFbidFrame.dkpCheckBox:SetScript("OnClick", function()
+            lfbid_useDKPCheck = this:GetChecked() and 1 or nil
+            RefreshLFBidBidList()
+        end)
+        if getglobal("LFBidUseDKPCheckBoxText") then
+            getglobal("LFBidUseDKPCheckBoxText"):SetText("Check DKP")
+            getglobal("LFBidUseDKPCheckBoxText"):ClearAllPoints()
+            getglobal("LFBidUseDKPCheckBoxText"):SetPoint("RIGHT", LFbidFrame.dkpCheckBox, "LEFT", -2, 1)
+        end
+
         LFbidFrame.text = LFbidFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         if LFbidFrame.text then
-            LFbidFrame.text:SetPoint("TOP", LFbidFrame.stopBtn, "BOTTOM", 0, -6)
+            LFbidFrame.text:SetPoint("TOP", LFbidFrame, "TOP", 0, -34)
         end
 
         LFbidFrame.itemLinkButton = CreateFrame("Button", nil, LFbidFrame)
         LFbidFrame.itemLinkButton:SetWidth(380)
         LFbidFrame.itemLinkButton:SetHeight(18)
-        LFbidFrame.itemLinkButton:SetPoint("TOP", LFbidFrame.stopBtn, "BOTTOM", 0, -6)
+        LFbidFrame.itemLinkButton:SetPoint("TOP", LFbidFrame, "TOP", 0, -34)
         LFbidFrame.itemLinkButton.itemLink = nil
         local mlItemButton = LFbidFrame.itemLinkButton
         LFbidFrame.itemLinkButton:SetScript("OnEnter", function()
@@ -870,6 +1163,14 @@ local function OpenLFBidWindow(itemLink, bidMode)
     lfbid_bidMode = bidMode or "points"
     lfbid_bids = {}
     lfbid_rollSeen = {}
+    if LFbidFrame.dkpCheckBox then
+        LFbidFrame.dkpCheckBox:SetChecked(lfbid_useDKPCheck)
+    end
+    if LFbidFrame.alphaSlider then
+        LFbidFrame.alphaSlider:SetValue(lfbid_backdropAlpha)
+    end
+    ApplyLFBidBackdropAlpha()
+    RefreshMasterLootButtons()
     RefreshLFBidBidList()
     lfbid_windowOpen = true
     LFbidFrame:Show()
@@ -963,6 +1264,13 @@ if not lfbid_whisperFrame then
         if sourceType == "addon" and IsClosePayload(msg) then
             return
         end
+        if sourceType == "addon" then
+            local addonChannel = p3 or arg3
+            local dkpPlayer = ParseDKPDeltaMessage(msg)
+            if addonChannel == "RAID" and dkpPlayer then
+                return
+            end
+        end
 
         local finalName, points, spec = ParseBidMessage(msg, sender)
         
@@ -990,13 +1298,29 @@ lfbid_openSyncFrame:SetScript("OnEvent", function(_, eventName, p1, p2, p3, p4)
     end
 
     local prefix = p1 or arg1
-    if prefix ~= LFBID_ADDON_PREFIX then
+    local msg = p2 or arg2
+    local channel = p3 or arg3
+    local sender = p4 or arg4
+    if not msg or msg == "" then
         return
     end
 
-    local msg = p2 or arg2
-    local sender = p4 or arg4
-    if not msg or msg == "" then
+    -- External addon can push DKP changes in RAID addon channel: "Player +/- Points".
+    -- Only process DKP changes from the LFDKP prefix.
+    if channel == "RAID" and prefix == LFDKP_ADDON_PREFIX then
+        local dkpPlayer, dkpDelta = ParseDKPDeltaMessage(msg)
+        if dkpPlayer and dkpDelta then
+            if ApplyDKPDelta(dkpPlayer, dkpDelta) and lfbid_windowOpen then
+                RefreshLFBidBidList()
+            end
+            return
+        end
+
+        print("LFBid: Received LFDKP message but could not parse: " .. tostring(msg))
+        return
+    end
+
+    if prefix ~= LFBID_ADDON_PREFIX then
         return
     end
 
@@ -1064,10 +1388,8 @@ local function HandleLFBidSlash(msg)
         end
         lfbid_activeItem = rest
         lfbid_openItemLink = rest
-        lfbid_biddingOpen = true
+        lfbid_biddingOpen = false
         lfbid_bidMode = "points"
-        SendBiddingStartMessage(rest)
-        SendSafeChatMessage("Start bidding on item: " .. rest, "RAID_WARNING")
         OpenLFBidWindow(rest, "points")
     elseif cmd == "roll" then
         if not IsPlayerMasterLooter() then
@@ -1088,7 +1410,7 @@ local function HandleLFBidSlash(msg)
         lfbid_biddingOpen = true
         lfbid_bidMode = "roll"
         lfbid_rollSeen = {}
-        SendSafeChatMessage("Start rolling for item: " .. rest, "RAID_WARNING")
+        SendSafeChatMessage("Start rolling for item: " .. rest, "RAID")
         OpenLFBidWindow(rest, "roll")
     elseif cmd == "open" then
         if lfbid_openWindowOpen then
