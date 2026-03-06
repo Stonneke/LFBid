@@ -224,6 +224,20 @@ local function IsPlayerMasterLooter()
     return string.lower(tostring(myName)) == string.lower(tostring(lootMasterName))
 end
 
+local function IsPlayerFounderOrBanker()
+    if not GetGuildInfo then
+        return false
+    end
+
+    local _, rankName = GetGuildInfo("player")
+    if not rankName or rankName == "" then
+        return false
+    end
+
+    local normalizedRank = string.lower(tostring(rankName))
+    return normalizedRank == "founder" or normalizedRank == "banker"
+end
+
 local function SendBiddingStartMessage(itemLink)
     if not SendAddonMessage then
         return false
@@ -2059,6 +2073,10 @@ local function HandleLFBidSlash(msg)
         end
         OpenLFBidOpenWindow()
     elseif cmd == "options" then
+        if not IsPlayerMasterLooter() and not IsPlayerFounderOrBanker() then
+            print("LFBid: /lfbid options is only available to the Master Looter.")
+            return
+        end
         if lfbid_optionsWindowOpen then
             print("LFBid options window already open.")
             return
