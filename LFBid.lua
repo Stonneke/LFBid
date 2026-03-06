@@ -6,6 +6,11 @@ local lfbid_windowOpen = false  -- track if the bidding window is currently visi
 local lfbid_timerFrame
 local lfbid_openFrame
 local lfbid_openWindowOpen = false
+local lfbid_optionsFrame
+local lfbid_optionsWindowOpen = false
+local lfbid_dkpSheetFrame
+local lfbid_dkpSheetWindowOpen = false
+local lfbid_dkpSheetScrollOffset = 0
 local lfbid_openType = "MS"
 local lfbid_openItemLink = ""
 local lfbid_biddingOpen = false
@@ -17,7 +22,10 @@ local LFBID_ADDON_PREFIX = "LFBid"
 local LFDKP_ADDON_PREFIX = "LFDKP"
 local lfbid_backdropAlpha = 0.30
 local lfbid_useDKPCheck = 1
+local lfbid_dkpCheckTier = 1
 local RefreshMasterLootButtons
+local RefreshLFBidBidList
+local RefreshLFBidDKPSheetWindow
 
 local function ApplyLFBidBackdropAlpha()
     if LFbidFrame then
@@ -25,6 +33,12 @@ local function ApplyLFBidBackdropAlpha()
     end
     if lfbid_openFrame then
         lfbid_openFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+    end
+    if lfbid_optionsFrame then
+        lfbid_optionsFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+    end
+    if lfbid_dkpSheetFrame then
+        lfbid_dkpSheetFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
     end
 end
 
@@ -299,9 +313,22 @@ end
 local function GetPlayerDKPInfo(playerName)
     local dkpKey = FindDKPPlayerKey(playerName)
     if not dkpKey then
-        return nil, false
+        return nil, nil, false
     end
-    return tonumber(LFTentDKP[dkpKey]), true
+
+    local entry = LFTentDKP[dkpKey]
+    local directValue = tonumber(entry)
+    if directValue ~= nil then
+        return directValue, 0, true
+    end
+
+    if type(entry) == "table" then
+        local tier1 = tonumber(entry.tier1 or entry.t1 or entry[1] or entry["Tier 1"] or entry.Tier1 or entry.points1 or entry.dkp1) or 0
+        local tier2 = tonumber(entry.tier2 or entry.t2 or entry[2] or entry["Tier 2"] or entry.Tier2 or entry.points2 or entry.dkp2) or 0
+        return tier1, tier2, true
+    end
+
+    return 0, 0, true
 end
 
 local function ParseDKPDeltaMessage(msg)
@@ -360,9 +387,38 @@ local function ApplyDKPDelta(playerName, delta)
         key = tostring(playerName)
     end
 
-    local oldPoints = tonumber(LFTentDKP[key]) or 0
-    local newPoints = oldPoints + delta
-    LFTentDKP[key] = newPoints
+    local entry = LFTentDKP[key]
+    local oldPoints = 0
+    local newPoints = 0
+
+    if type(entry) == "table" then
+        oldPoints = tonumber(entry.tier1 or entry.t1 or entry[1] or entry["Tier 1"] or entry.Tier1 or entry.points1 or entry.dkp1) or 0
+        newPoints = oldPoints + delta
+
+        if entry.t1 ~= nil then
+            entry.t1 = newPoints
+        elseif entry.tier1 ~= nil then
+            entry.tier1 = newPoints
+        elseif entry[1] ~= nil then
+            entry[1] = newPoints
+        elseif entry["Tier 1"] ~= nil then
+            entry["Tier 1"] = newPoints
+        elseif entry.Tier1 ~= nil then
+            entry.Tier1 = newPoints
+        elseif entry.points1 ~= nil then
+            entry.points1 = newPoints
+        elseif entry.dkp1 ~= nil then
+            entry.dkp1 = newPoints
+        else
+            entry.t1 = newPoints
+        end
+
+        LFTentDKP[key] = entry
+    else
+        oldPoints = tonumber(entry) or 0
+        newPoints = oldPoints + delta
+        LFTentDKP[key] = newPoints
+    end
 
     print("LFBid: DKP updated for " .. key .. ": " .. oldPoints .. " -> " .. newPoints)
     return true
@@ -378,7 +434,13 @@ local function BidHasEnoughDKP(bid)
         return true
     end
 
-    local playerDKP = GetPlayerDKPInfo(bid and bid.name)
+    local playerTier1, playerTier2 = GetPlayerDKPInfo(bid and bid.name)
+    local playerDKP
+    if lfbid_dkpCheckTier == 2 then
+        playerDKP = playerTier2
+    else
+        playerDKP = playerTier1
+    end
     if not playerDKP then
         playerDKP = 0
     end
@@ -396,8 +458,29 @@ local function IsUnknownZeroBid(bid)
         return false
     end
 
-    local _, isKnownPlayer = GetPlayerDKPInfo(bid and bid.name)
+    local _, _, isKnownPlayer = GetPlayerDKPInfo(bid and bid.name)
     return not isKnownPlayer
+end
+
+local function SetDKPCheckTier(tier)
+    if tier == 2 then
+        lfbid_dkpCheckTier = 2
+    else
+        lfbid_dkpCheckTier = 1
+    end
+
+    if lfbid_optionsFrame then
+        if lfbid_optionsFrame.t1RaidCheck then
+            lfbid_optionsFrame.t1RaidCheck:SetChecked(lfbid_dkpCheckTier == 1)
+        end
+        if lfbid_optionsFrame.t2RaidCheck then
+            lfbid_optionsFrame.t2RaidCheck:SetChecked(lfbid_dkpCheckTier == 2)
+        end
+    end
+
+    if LFbidFrame and LFbidFrame.gridCells then
+        RefreshLFBidBidList()
+    end
 end
 
 local function RemoveExistingBidForPlayer(playerName)
@@ -584,7 +667,7 @@ RefreshMasterLootButtons = function()
     end
 end
 
-local function RefreshLFBidBidList()
+RefreshLFBidBidList = function()
     if not LFbidFrame or not LFbidFrame.gridCells then
         print("LFBid: Cannot refresh, frame or grid is nil")
         return
@@ -1030,6 +1113,563 @@ local function OpenLFBidOpenWindow()
     lfbid_openFrame:Show()
 end
 
+local function GetTierPointsFromDKPEntry(entry)
+    local directValue = tonumber(entry)
+    if directValue ~= nil then
+        return directValue, 0
+    end
+
+    if type(entry) ~= "table" then
+        return 0, 0
+    end
+
+    local tier1 = tonumber(entry.tier1 or entry.t1 or entry[1] or entry["Tier 1"] or entry.Tier1 or entry.points1 or entry.dkp1) or 0
+    local tier2 = tonumber(entry.tier2 or entry.t2 or entry[2] or entry["Tier 2"] or entry.Tier2 or entry.points2 or entry.dkp2) or 0
+    return tier1, tier2
+end
+
+local function EnsureDKPDataLoaded()
+    if type(LFTentDKP) == "table" and next(LFTentDKP) ~= nil then
+        return
+    end
+
+    if type(LFTentDKPDefaults) == "table" and next(LFTentDKPDefaults) ~= nil then
+        LFTentDKP = LFTentDKPDefaults
+    end
+end
+
+local function BuildSortedDKPSheetRows()
+    EnsureDKPDataLoaded()
+
+    local rows = {}
+    if type(LFTentDKP) ~= "table" then
+        return rows
+    end
+
+    for playerName, value in pairs(LFTentDKP) do
+        local tier1, tier2 = GetTierPointsFromDKPEntry(value)
+        table.insert(rows, {
+            player = tostring(playerName or ""),
+            tier1 = tier1,
+            tier2 = tier2,
+        })
+    end
+
+    table.sort(rows, function(a, b)
+        return string.lower(tostring(a.player or "")) < string.lower(tostring(b.player or ""))
+    end)
+
+    return rows
+end
+
+local function NormalizeDKPPlayerName(name)
+    local text = tostring(name or "")
+    local dashPos = string.find(text, "-")
+    if dashPos and dashPos > 1 then
+        text = string.sub(text, 1, dashPos - 1)
+    end
+    return string.lower(text)
+end
+
+local function SyncDKPToGuildNotes()
+    EnsureDKPDataLoaded()
+
+    if type(LFTentDKP) ~= "table" then
+        print("LFBid: DKP table is empty or invalid.")
+        return
+    end
+
+    if not GetNumGuildMembers or not GetGuildRosterInfo or not GuildRoster then
+        print("LFBid: Guild roster API is not available.")
+        return
+    end
+
+    if not GuildRosterSetPublicNote and not GuildRosterSetNote then
+        print("LFBid: Public guild note API is not available.")
+        return
+    end
+
+    local previousShowOffline = nil
+    if SetGuildRosterShowOffline then
+        if GetGuildRosterShowOffline then
+            previousShowOffline = GetGuildRosterShowOffline() and 1 or 0
+        end
+        SetGuildRosterShowOffline(1)
+    end
+
+    GuildRoster()
+
+    local totalMembers = tonumber(GetNumGuildMembers(true)) or tonumber(GetNumGuildMembers()) or 0
+    if totalMembers <= 0 then
+        print("LFBid: No guild members found in roster.")
+        if SetGuildRosterShowOffline and previousShowOffline ~= nil then
+            SetGuildRosterShowOffline(previousShowOffline)
+            GuildRoster()
+        end
+        return
+    end
+
+    local guildIndexByName = {}
+    local idx
+    for idx = 1, totalMembers do
+        local rosterName = GetGuildRosterInfo(idx)
+        local lookup = NormalizeDKPPlayerName(rosterName)
+        if lookup ~= "" then
+            guildIndexByName[lookup] = idx
+        end
+    end
+
+    local updated = 0
+    local missing = 0
+    local writeFailed = 0
+    local replacedExisting = 0
+    local wroteFresh = 0
+    local playerName, value
+    for playerName, value in pairs(LFTentDKP) do
+        local lookup = NormalizeDKPPlayerName(playerName)
+        local memberIndex = guildIndexByName[lookup]
+
+        if memberIndex then
+            local tier1, tier2 = GetTierPointsFromDKPEntry(value)
+            local dkpToken = "[" .. tostring(tier1) .. ":" .. tostring(tier2) .. "]"
+
+            local _, _, _, _, _, _, existingPublicNote = GetGuildRosterInfo(memberIndex)
+            local currentNote = tostring(existingPublicNote or "")
+            local hadDKPToken = string.find(currentNote, "%[%s*%-?%d+%s*:%s*%-?%d+%s*%]") ~= nil
+
+            local noteText
+            if hadDKPToken then
+                noteText = string.gsub(currentNote, "%[%s*%-?%d+%s*:%s*%-?%d+%s*%]", dkpToken, 1)
+                replacedExisting = replacedExisting + 1
+            else
+                noteText = dkpToken
+                wroteFresh = wroteFresh + 1
+            end
+
+            local wrote = false
+            if GuildRosterSetPublicNote then
+                GuildRosterSetPublicNote(memberIndex, noteText)
+                wrote = true
+            elseif GuildRosterSetNote then
+                GuildRosterSetNote(memberIndex, noteText)
+                wrote = true
+            end
+
+            if wrote then
+                updated = updated + 1
+            else
+                writeFailed = writeFailed + 1
+            end
+        else
+            missing = missing + 1
+        end
+    end
+
+    if SetGuildRosterShowOffline and previousShowOffline ~= nil then
+        SetGuildRosterShowOffline(previousShowOffline)
+    end
+    GuildRoster()
+    print("LFBid: DKP => Notes complete. Updated " .. updated .. " (replaced " .. replacedExisting .. ", new " .. wroteFresh .. "), missing " .. missing .. ", failed " .. writeFailed .. ".")
+end
+
+local function SyncGuildNotesToDKP()
+    if not GetNumGuildMembers or not GetGuildRosterInfo or not GuildRoster then
+        print("LFBid: Guild roster API is not available.")
+        return
+    end
+
+    local previousShowOffline = nil
+    if SetGuildRosterShowOffline then
+        if GetGuildRosterShowOffline then
+            previousShowOffline = GetGuildRosterShowOffline() and 1 or 0
+        end
+        SetGuildRosterShowOffline(1)
+    end
+
+    GuildRoster()
+
+    local totalMembers = tonumber(GetNumGuildMembers(true)) or tonumber(GetNumGuildMembers()) or 0
+    if totalMembers <= 0 then
+        print("LFBid: No guild members found in roster.")
+        if SetGuildRosterShowOffline and previousShowOffline ~= nil then
+            SetGuildRosterShowOffline(previousShowOffline)
+            GuildRoster()
+        end
+        return
+    end
+
+    if type(LFTentDKP) ~= "table" then
+        LFTentDKP = {}
+    end
+
+    local updated = 0
+    local unchanged = 0
+    local skipped = 0
+    local idx
+    for idx = 1, totalMembers do
+        local rosterName, _, _, _, _, _, publicNote = GetGuildRosterInfo(idx)
+        local _, _, tier1Text, tier2Text = string.find(tostring(publicNote or ""), "%[%s*(%-?%d+)%s*:%s*(%-?%d+)%s*%]")
+
+        if rosterName and tier1Text and tier2Text then
+            local tier1 = tonumber(tier1Text)
+            local tier2 = tonumber(tier2Text)
+
+            if tier1 ~= nil and tier2 ~= nil then
+                local key = FindDKPPlayerKey(rosterName)
+                if not key then
+                    key = tostring(rosterName)
+                end
+
+                local current = LFTentDKP[key]
+                local currentT1, currentT2 = GetTierPointsFromDKPEntry(current)
+                if currentT1 == tier1 and currentT2 == tier2 then
+                    unchanged = unchanged + 1
+                else
+                    LFTentDKP[key] = { t1 = tier1, t2 = tier2 }
+                    updated = updated + 1
+                end
+            else
+                skipped = skipped + 1
+            end
+        else
+            skipped = skipped + 1
+        end
+    end
+
+    if SetGuildRosterShowOffline and previousShowOffline ~= nil then
+        SetGuildRosterShowOffline(previousShowOffline)
+    end
+    GuildRoster()
+
+    if lfbid_dkpSheetWindowOpen then
+        RefreshLFBidDKPSheetWindow()
+    end
+
+    print("LFBid: Notes => DKP complete. Updated " .. updated .. ", unchanged " .. unchanged .. ", skipped " .. skipped .. ".")
+end
+
+RefreshLFBidDKPSheetWindow = function()
+    if not lfbid_dkpSheetFrame or not lfbid_dkpSheetFrame.rows then
+        return
+    end
+
+    local dataRows = BuildSortedDKPSheetRows()
+    local maxRows = table.getn(lfbid_dkpSheetFrame.rows)
+    local rowCount = table.getn(dataRows)
+    local maxOffset = rowCount - maxRows
+    if maxOffset < 0 then
+        maxOffset = 0
+    end
+
+    if lfbid_dkpSheetScrollOffset > maxOffset then
+        lfbid_dkpSheetScrollOffset = maxOffset
+    end
+    if lfbid_dkpSheetScrollOffset < 0 then
+        lfbid_dkpSheetScrollOffset = 0
+    end
+
+    if lfbid_dkpSheetFrame.scrollBar then
+        lfbid_dkpSheetFrame.scrollBar:SetMinMaxValues(0, maxOffset)
+        lfbid_dkpSheetFrame.updatingScrollBar = true
+        lfbid_dkpSheetFrame.scrollBar:SetValue(lfbid_dkpSheetScrollOffset)
+        lfbid_dkpSheetFrame.updatingScrollBar = false
+
+        if maxOffset > 0 then
+            lfbid_dkpSheetFrame.scrollBar:SetAlpha(1)
+        else
+            lfbid_dkpSheetFrame.scrollBar:SetAlpha(0.5)
+        end
+    end
+
+    local startIndex = lfbid_dkpSheetScrollOffset + 1
+
+    local i
+    for i = 1, maxRows do
+        local rowWidget = lfbid_dkpSheetFrame.rows[i]
+        local rowData = dataRows[startIndex + i - 1]
+        if rowData then
+            rowWidget.player:SetText(rowData.player)
+            rowWidget.tier1:SetText(tostring(rowData.tier1))
+            rowWidget.tier2:SetText(tostring(rowData.tier2))
+            rowWidget.player:Show()
+            rowWidget.tier1:Show()
+            rowWidget.tier2:Show()
+        else
+            rowWidget.player:SetText("")
+            rowWidget.tier1:SetText("")
+            rowWidget.tier2:SetText("")
+            rowWidget.player:Hide()
+            rowWidget.tier1:Hide()
+            rowWidget.tier2:Hide()
+        end
+    end
+
+    if rowCount == 0 then
+        lfbid_dkpSheetFrame.emptyText:SetText("No DKP entries found.")
+        lfbid_dkpSheetFrame.emptyText:Show()
+    else
+        lfbid_dkpSheetFrame.emptyText:Hide()
+    end
+
+    if rowCount > 0 then
+        local endIndex = startIndex + maxRows - 1
+        if endIndex > rowCount then
+            endIndex = rowCount
+        end
+        lfbid_dkpSheetFrame.moreText:SetText("Showing " .. tostring(startIndex) .. "-" .. tostring(endIndex) .. " of " .. tostring(rowCount))
+        lfbid_dkpSheetFrame.moreText:Show()
+    else
+        lfbid_dkpSheetFrame.moreText:Hide()
+    end
+end
+
+local function OpenLFBidDKPSheetWindow()
+    if not lfbid_dkpSheetFrame then
+        lfbid_dkpSheetFrame = CreateFrame("Frame", "LFBidDKPSheetFrame", UIParent)
+        lfbid_dkpSheetFrame:SetWidth(420)
+        lfbid_dkpSheetFrame:SetHeight(410)
+        lfbid_dkpSheetFrame:SetPoint("CENTER", UIParent, "CENTER", 280, 40)
+        lfbid_dkpSheetFrame:SetFrameStrata("DIALOG")
+        lfbid_dkpSheetFrame:SetBackdrop({
+            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+        lfbid_dkpSheetFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+        lfbid_dkpSheetFrame:EnableMouse(true)
+        lfbid_dkpSheetFrame:SetMovable(true)
+        lfbid_dkpSheetFrame:RegisterForDrag("LeftButton")
+        lfbid_dkpSheetFrame:SetScript("OnDragStart", function()
+            lfbid_dkpSheetFrame:StartMoving()
+        end)
+        lfbid_dkpSheetFrame:SetScript("OnDragStop", function()
+            lfbid_dkpSheetFrame:StopMovingOrSizing()
+        end)
+        if lfbid_dkpSheetFrame.EnableMouseWheel then
+            lfbid_dkpSheetFrame:EnableMouseWheel(true)
+            lfbid_dkpSheetFrame:SetScript("OnMouseWheel", function()
+                local delta = arg1 or 0
+                if delta == 0 then
+                    return
+                end
+
+                local step = 1
+                if IsShiftKeyDown and IsShiftKeyDown() then
+                    step = 5
+                end
+
+                if delta > 0 then
+                    lfbid_dkpSheetScrollOffset = lfbid_dkpSheetScrollOffset - step
+                else
+                    lfbid_dkpSheetScrollOffset = lfbid_dkpSheetScrollOffset + step
+                end
+
+                RefreshLFBidDKPSheetWindow()
+            end)
+        end
+
+        lfbid_dkpSheetFrame.title = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_dkpSheetFrame.title:SetPoint("TOPLEFT", lfbid_dkpSheetFrame, "TOPLEFT", 10, -14)
+        lfbid_dkpSheetFrame.title:SetText("LFBid DKP Sheet")
+
+        lfbid_dkpSheetFrame.closeBtn = CreateFrame("Button", nil, lfbid_dkpSheetFrame, "UIPanelButtonTemplate")
+        lfbid_dkpSheetFrame.closeBtn:SetWidth(24)
+        lfbid_dkpSheetFrame.closeBtn:SetHeight(24)
+        lfbid_dkpSheetFrame.closeBtn:SetPoint("TOPRIGHT", lfbid_dkpSheetFrame, "TOPRIGHT", -4, -4)
+        lfbid_dkpSheetFrame.closeBtn:SetText("X")
+        lfbid_dkpSheetFrame.closeBtn:SetScript("OnClick", function()
+            lfbid_dkpSheetFrame:Hide()
+            lfbid_dkpSheetWindowOpen = false
+        end)
+
+        lfbid_dkpSheetFrame.headerPlayer = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_dkpSheetFrame.headerPlayer:SetPoint("TOPLEFT", lfbid_dkpSheetFrame, "TOPLEFT", 16, -44)
+        lfbid_dkpSheetFrame.headerPlayer:SetText("Player")
+
+        lfbid_dkpSheetFrame.headerTier1 = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_dkpSheetFrame.headerTier1:SetPoint("TOPLEFT", lfbid_dkpSheetFrame, "TOPLEFT", 240, -44)
+        lfbid_dkpSheetFrame.headerTier1:SetText("Tier 1")
+
+        lfbid_dkpSheetFrame.headerTier2 = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_dkpSheetFrame.headerTier2:SetPoint("TOPLEFT", lfbid_dkpSheetFrame, "TOPLEFT", 320, -44)
+        lfbid_dkpSheetFrame.headerTier2:SetText("Tier 2")
+
+        lfbid_dkpSheetFrame.scrollBar = CreateFrame("Slider", "LFBidDKPSheetScrollBar", lfbid_dkpSheetFrame)
+        lfbid_dkpSheetFrame.scrollBar:SetPoint("TOPRIGHT", lfbid_dkpSheetFrame, "TOPRIGHT", -8, -30)
+        lfbid_dkpSheetFrame.scrollBar:SetPoint("BOTTOMRIGHT", lfbid_dkpSheetFrame, "BOTTOMRIGHT", -8, 30)
+        lfbid_dkpSheetFrame.scrollBar:SetWidth(16)
+        lfbid_dkpSheetFrame.scrollBar:SetMinMaxValues(0, 0)
+        lfbid_dkpSheetFrame.scrollBar:SetValueStep(1)
+        lfbid_dkpSheetFrame.scrollBar:SetThumbTexture("Interface\\Buttons\\UI-ScrollBar-Knob")
+
+        local sbBg = lfbid_dkpSheetFrame.scrollBar:CreateTexture(nil, "BACKGROUND")
+        sbBg:SetTexture("Interface\\Buttons\\UI-SliderBar-Background")
+        sbBg:SetAllPoints(lfbid_dkpSheetFrame.scrollBar)
+        sbBg:SetVertexColor(0.2, 0.2, 0.2, 0.8)
+
+        local thumb = lfbid_dkpSheetFrame.scrollBar:GetThumbTexture()
+        if thumb then
+            thumb:SetWidth(16)
+            thumb:SetHeight(24)
+        end
+
+        lfbid_dkpSheetFrame.scrollBar:SetValue(0)
+        lfbid_dkpSheetFrame.scrollBar:SetScript("OnValueChanged", function()
+            if lfbid_dkpSheetFrame.updatingScrollBar then
+                return
+            end
+
+            local value = arg1
+            if value == nil and this and this.GetValue then
+                value = this:GetValue()
+            end
+            value = tonumber(value) or 0
+            value = math.floor(value + 0.5)
+
+            if value ~= lfbid_dkpSheetScrollOffset then
+                lfbid_dkpSheetScrollOffset = value
+                RefreshLFBidDKPSheetWindow()
+            end
+        end)
+
+        lfbid_dkpSheetFrame.rows = {}
+        local maxRows = 14
+        local startY = -66
+        local rowStep = 22
+        local idx
+        for idx = 1, maxRows do
+            local y = startY - ((idx - 1) * rowStep)
+            local row = {}
+
+            row.player = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.player:SetPoint("TOPLEFT", lfbid_dkpSheetFrame, "TOPLEFT", 16, y)
+            row.player:SetWidth(210)
+            row.player:SetJustifyH("LEFT")
+
+            row.tier1 = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.tier1:SetPoint("TOPLEFT", lfbid_dkpSheetFrame, "TOPLEFT", 240, y)
+            row.tier1:SetWidth(70)
+            row.tier1:SetJustifyH("LEFT")
+
+            row.tier2 = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.tier2:SetPoint("TOPLEFT", lfbid_dkpSheetFrame, "TOPLEFT", 320, y)
+            row.tier2:SetWidth(70)
+            row.tier2:SetJustifyH("LEFT")
+
+            table.insert(lfbid_dkpSheetFrame.rows, row)
+        end
+
+        lfbid_dkpSheetFrame.emptyText = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        lfbid_dkpSheetFrame.emptyText:SetPoint("TOP", lfbid_dkpSheetFrame, "TOP", 0, -190)
+        lfbid_dkpSheetFrame.emptyText:SetText("")
+
+        lfbid_dkpSheetFrame.moreText = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        lfbid_dkpSheetFrame.moreText:SetPoint("BOTTOMLEFT", lfbid_dkpSheetFrame, "BOTTOMLEFT", 16, 14)
+        lfbid_dkpSheetFrame.moreText:SetText("")
+    end
+
+    lfbid_dkpSheetFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+    lfbid_dkpSheetScrollOffset = 0
+    RefreshLFBidDKPSheetWindow()
+    lfbid_dkpSheetWindowOpen = true
+    lfbid_dkpSheetFrame:Show()
+end
+
+local function OpenLFBidOptionsWindow()
+    if not lfbid_optionsFrame then
+        lfbid_optionsFrame = CreateFrame("Frame", "LFBidOptionsFrame", UIParent)
+        lfbid_optionsFrame:SetWidth(260)
+        lfbid_optionsFrame:SetHeight(260)
+        lfbid_optionsFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 100)
+        lfbid_optionsFrame:SetFrameStrata("DIALOG")
+        lfbid_optionsFrame:SetBackdrop({
+            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+        lfbid_optionsFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+        lfbid_optionsFrame:EnableMouse(true)
+        lfbid_optionsFrame:SetMovable(true)
+        lfbid_optionsFrame:RegisterForDrag("LeftButton")
+        lfbid_optionsFrame:SetScript("OnDragStart", function()
+            lfbid_optionsFrame:StartMoving()
+        end)
+        lfbid_optionsFrame:SetScript("OnDragStop", function()
+            lfbid_optionsFrame:StopMovingOrSizing()
+        end)
+
+        lfbid_optionsFrame.title = lfbid_optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_optionsFrame.title:SetPoint("TOPLEFT", lfbid_optionsFrame, "TOPLEFT", 10, -14)
+        lfbid_optionsFrame.title:SetText("LFBid Options")
+
+        lfbid_optionsFrame.closeBtn = CreateFrame("Button", nil, lfbid_optionsFrame, "UIPanelButtonTemplate")
+        lfbid_optionsFrame.closeBtn:SetWidth(24)
+        lfbid_optionsFrame.closeBtn:SetHeight(24)
+        lfbid_optionsFrame.closeBtn:SetPoint("TOPRIGHT", lfbid_optionsFrame, "TOPRIGHT", -4, -4)
+        lfbid_optionsFrame.closeBtn:SetText("X")
+        lfbid_optionsFrame.closeBtn:SetScript("OnClick", function()
+            lfbid_optionsFrame:Hide()
+            lfbid_optionsWindowOpen = false
+        end)
+
+        lfbid_optionsFrame.dkpToNotesBtn = CreateFrame("Button", nil, lfbid_optionsFrame, "UIPanelButtonTemplate")
+        lfbid_optionsFrame.dkpToNotesBtn:SetWidth(200)
+        lfbid_optionsFrame.dkpToNotesBtn:SetHeight(26)
+        lfbid_optionsFrame.dkpToNotesBtn:SetPoint("TOP", lfbid_optionsFrame, "TOP", 0, -46)
+        lfbid_optionsFrame.dkpToNotesBtn:SetText("DKP => Notes")
+        lfbid_optionsFrame.dkpToNotesBtn:SetScript("OnClick", function()
+            SyncDKPToGuildNotes()
+        end)
+
+        lfbid_optionsFrame.notesToDkpBtn = CreateFrame("Button", nil, lfbid_optionsFrame, "UIPanelButtonTemplate")
+        lfbid_optionsFrame.notesToDkpBtn:SetWidth(200)
+        lfbid_optionsFrame.notesToDkpBtn:SetHeight(26)
+        lfbid_optionsFrame.notesToDkpBtn:SetPoint("TOP", lfbid_optionsFrame.dkpToNotesBtn, "BOTTOM", 0, -10)
+        lfbid_optionsFrame.notesToDkpBtn:SetText("Notes => DKP")
+        lfbid_optionsFrame.notesToDkpBtn:SetScript("OnClick", function()
+            SyncGuildNotesToDKP()
+        end)
+
+        lfbid_optionsFrame.showDKPSheetBtn = CreateFrame("Button", nil, lfbid_optionsFrame, "UIPanelButtonTemplate")
+        lfbid_optionsFrame.showDKPSheetBtn:SetWidth(200)
+        lfbid_optionsFrame.showDKPSheetBtn:SetHeight(26)
+        lfbid_optionsFrame.showDKPSheetBtn:SetPoint("TOP", lfbid_optionsFrame.notesToDkpBtn, "BOTTOM", 0, -10)
+        lfbid_optionsFrame.showDKPSheetBtn:SetText("Show DKP sheet")
+        lfbid_optionsFrame.showDKPSheetBtn:SetScript("OnClick", function()
+            OpenLFBidDKPSheetWindow()
+        end)
+
+        lfbid_optionsFrame.raidTierLabel = lfbid_optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_optionsFrame.raidTierLabel:SetPoint("TOPLEFT", lfbid_optionsFrame.showDKPSheetBtn, "BOTTOMLEFT", 0, -14)
+        lfbid_optionsFrame.raidTierLabel:SetText("Bid DKP Tier")
+
+        lfbid_optionsFrame.t1RaidCheck = CreateFrame("CheckButton", "LFBidT1RaidCheckButton", lfbid_optionsFrame, "UICheckButtonTemplate")
+        lfbid_optionsFrame.t1RaidCheck:SetPoint("TOPLEFT", lfbid_optionsFrame.raidTierLabel, "BOTTOMLEFT", -2, -6)
+        lfbid_optionsFrame.t1RaidCheck:SetScript("OnClick", function()
+            SetDKPCheckTier(1)
+        end)
+        if getglobal("LFBidT1RaidCheckButtonText") then
+            getglobal("LFBidT1RaidCheckButtonText"):SetText("T1 Raid")
+        end
+
+        lfbid_optionsFrame.t2RaidCheck = CreateFrame("CheckButton", "LFBidT2RaidCheckButton", lfbid_optionsFrame, "UICheckButtonTemplate")
+        lfbid_optionsFrame.t2RaidCheck:SetPoint("TOPLEFT", lfbid_optionsFrame.t1RaidCheck, "BOTTOMLEFT", 0, -2)
+        lfbid_optionsFrame.t2RaidCheck:SetScript("OnClick", function()
+            SetDKPCheckTier(2)
+        end)
+        if getglobal("LFBidT2RaidCheckButtonText") then
+            getglobal("LFBidT2RaidCheckButtonText"):SetText("T2 Raid")
+        end
+    end
+
+    SetDKPCheckTier(lfbid_dkpCheckTier)
+    lfbid_optionsFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+    lfbid_optionsWindowOpen = true
+    lfbid_optionsFrame:Show()
+end
+
 local function OpenLFBidWindow(itemLink, bidMode)
     -- create the frame only once
     if not LFbidFrame then
@@ -1418,8 +2058,14 @@ local function HandleLFBidSlash(msg)
             return
         end
         OpenLFBidOpenWindow()
+    elseif cmd == "options" then
+        if lfbid_optionsWindowOpen then
+            print("LFBid options window already open.")
+            return
+        end
+        OpenLFBidOptionsWindow()
     else
-        print("LFbid commands:\n  /lfbid start <itemlink>\n  /lfbid roll <itemlink>\n  /lfbid open")
+        print("LFbid commands:\n  /lfbid start <itemlink>\n  /lfbid roll <itemlink>\n  /lfbid open\n  /lfbid options")
     end
 end
 
