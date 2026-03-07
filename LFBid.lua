@@ -23,9 +23,17 @@ local LFDKP_ADDON_PREFIX = "LFDKP"
 local lfbid_backdropAlpha = 0.30
 local lfbid_useDKPCheck = 1
 local lfbid_dkpCheckTier = 1
+local lfbid_bidListScrollOffset = 0
+local lfbid_bidListMaxOffset = 0
+local lfbid_specScrollOffsets = {}
+local lfbid_hoveredSpec = nil
+local lfbid_openAltBid = false
+local LFBID_ROLL_VISIBLE_ROWS = 10
+local LFBID_POINTS_VISIBLE_ROWS = 6
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
+local OpenLFBidWindow
 
 local function ApplyLFBidBackdropAlpha()
     if LFbidFrame then
@@ -47,10 +55,10 @@ print("LFBid loaded. Use /lfbid for commands.")
 
 local function ParseBidMessage(msg, fallbackName)
     if not msg or msg == "" then
-        return nil, nil, nil
+        return nil, nil, nil, false
     end
 
-    local parsedName, points, spec
+    local parsedName, points, spec, altBid
     local space1 = string.find(msg, " ")
     if space1 then
         parsedName = string.sub(msg, 1, space1 - 1)
@@ -58,12 +66,22 @@ local function ParseBidMessage(msg, fallbackName)
         local space2 = string.find(rest, " ")
         if space2 then
             points = tonumber(string.sub(rest, 1, space2 - 1))
-            spec = string.sub(rest, space2 + 1)
+            local specPart = string.sub(rest, space2 + 1)
+            local space3 = string.find(specPart, " ")
+            if space3 then
+                spec = string.sub(specPart, 1, space3 - 1)
+                local altMarker = string.sub(specPart, space3 + 1)
+                if altMarker and string.lower(tostring(altMarker)) == "alt" then
+                    altBid = true
+                end
+            else
+                spec = specPart
+            end
         end
     end
 
     local finalName = parsedName or fallbackName
-    return finalName, points, spec
+    return finalName, points, spec, altBid and true or false
 end
 
 local function ParseSystemRollMessage(msg)
@@ -238,6 +256,20 @@ local function IsPlayerFounderOrBanker()
     return normalizedRank == "founder" or normalizedRank == "banker"
 end
 
+local function IsPlayerGuildRankAlt()
+    if not GetGuildInfo then
+        return false
+    end
+
+    local _, rankName = GetGuildInfo("player")
+    if not rankName or rankName == "" then
+        return false
+    end
+
+    local normalizedRank = string.lower(tostring(rankName))
+    return normalizedRank == "alt" or normalizedRank == "alts"
+end
+
 local function SendBiddingStartMessage(itemLink)
     if not SendAddonMessage then
         return false
@@ -291,8 +323,8 @@ local function NormalizeSpec(spec)
         return "MS"
     elseif lower == "os" then
         return "OS"
-    elseif lower == "alt" then
-        return "Alt"
+    elseif lower == "alt" or lower == "tmog" or lower == "t-mog" then
+        return "T-MOG"
     end
 
     local first = string.sub(text, 1, 1)
@@ -687,6 +719,141 @@ RefreshLFBidBidList = function()
         return
     end
 
+    local function ClampBidListOffset(maxOffset)
+        local maxValue = tonumber(maxOffset) or 0
+        if maxValue < 0 then
+            maxValue = 0
+        end
+
+        if lfbid_bidListScrollOffset < 0 then
+            lfbid_bidListScrollOffset = 0
+        elseif lfbid_bidListScrollOffset > maxValue then
+            lfbid_bidListScrollOffset = maxValue
+        end
+
+        lfbid_bidListMaxOffset = maxValue
+    end
+
+    local function UpdateBidListScrollBar(totalEntries)
+        local totalCount = tonumber(totalEntries) or 0
+        if totalCount < 0 then
+            totalCount = 0
+        end
+
+        local maxOffset = totalCount - LFBID_ROLL_VISIBLE_ROWS
+        if maxOffset < 0 then
+            maxOffset = 0
+        end
+
+        ClampBidListOffset(maxOffset)
+        if not LFbidFrame.bidScrollBar then
+            return
+        end
+
+        LFbidFrame.bidScrollBar:SetMinMaxValues(0, lfbid_bidListMaxOffset)
+        LFbidFrame.bidScrollBar:SetValueStep(1)
+        LFbidFrame.bidScrollBar:SetValue(lfbid_bidListScrollOffset)
+
+        if lfbid_bidListMaxOffset > 0 then
+            LFbidFrame.bidScrollBar:Show()
+        else
+            LFbidFrame.bidScrollBar:Hide()
+        end
+    end
+
+    local function GetFixedBidCellHeight(visibleRows)
+        local headerHeight = 20
+        local lineHeight = 12
+        local bottomPadding = 10
+        local rows = tonumber(visibleRows) or 1
+        if rows < 1 then
+            rows = 1
+        end
+        return headerHeight + (rows * lineHeight) + bottomPadding
+    end
+
+    local function CountBidsForSpec(specName)
+        local target = tostring(specName or "")
+        if target == "" then
+            return 0
+        end
+
+        local count = 0
+        for _, bid in ipairs(lfbid_bids) do
+            if bid and NormalizeSpec(bid.spec) == target then
+                count = count + 1
+            end
+        end
+        return count
+    end
+
+    local function AttachSpecScrollBar(cell)
+        if not cell or cell.scrollBar then
+            return
+        end
+
+        cell:EnableMouse(true)
+        cell:SetScript("OnEnter", function()
+            if cell.specKey and cell.specKey ~= "" then
+                lfbid_hoveredSpec = cell.specKey
+            end
+        end)
+        cell:SetScript("OnLeave", function()
+            if lfbid_hoveredSpec == cell.specKey then
+                lfbid_hoveredSpec = nil
+            end
+        end)
+
+        cell.scrollBar = CreateFrame("Slider", nil, cell)
+        cell.scrollBar:SetPoint("TOPRIGHT", cell, "TOPRIGHT", -4, -24)
+        cell.scrollBar:SetPoint("BOTTOMRIGHT", cell, "BOTTOMRIGHT", -4, 8)
+        cell.scrollBar:SetWidth(10)
+        if cell.scrollBar.SetOrientation then
+            cell.scrollBar:SetOrientation("VERTICAL")
+        end
+        cell.scrollBar:SetMinMaxValues(0, 0)
+        cell.scrollBar:SetValueStep(1)
+        cell.scrollBar:SetValue(0)
+        cell.scrollBar:SetThumbTexture("Interface\\Buttons\\UI-ScrollBar-Knob")
+        cell.scrollBar:SetBackdrop({
+            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 12, edgeSize = 12,
+            insets = { left = 3, right = 3, top = 3, bottom = 3 }
+        })
+        cell.scrollBar:SetBackdropColor(0, 0, 0, 0.20)
+
+        local ownerCell = cell
+        cell.scrollBar:SetScript("OnValueChanged", function()
+            local specKey = ownerCell.specKey
+            if not specKey or specKey == "" then
+                return
+            end
+
+            local value = tonumber(arg1) or 0
+            if value < 0 then
+                value = 0
+            end
+
+            local maxOffset = CountBidsForSpec(specKey) - LFBID_POINTS_VISIBLE_ROWS
+            if maxOffset < 0 then
+                maxOffset = 0
+            end
+
+            local nextOffset = math.floor(value + 0.5)
+            if nextOffset > maxOffset then
+                nextOffset = maxOffset
+            elseif nextOffset < 0 then
+                nextOffset = 0
+            end
+
+            if nextOffset ~= (lfbid_specScrollOffsets[specKey] or 0) then
+                lfbid_specScrollOffsets[specKey] = nextOffset
+                RefreshLFBidBidList()
+            end
+        end)
+    end
+
     if lfbid_bidMode == "roll" then
         local specs = {"ROLLS"}
         local grouped = {
@@ -711,10 +878,12 @@ RefreshLFBidBidList = function()
         end)
 
         local neededCells = 1
-        local colWidth = 410
-        local cellGapY = 8
+        local colWidth = 392
         local startX = 10
-        local startY = -58
+        local startY = -76
+        local frameTopOffset = 76
+        local frameBottomPadding = 40
+        local cellHeight = GetFixedBidCellHeight(LFBID_ROLL_VISIBLE_ROWS)
 
         local cell = LFbidFrame.gridCells[1]
         if not cell then
@@ -741,16 +910,33 @@ RefreshLFBidBidList = function()
             LFbidFrame.gridCells[1] = cell
         end
 
+        cell:SetWidth(colWidth)
+        if cell.text then
+            cell.text:SetWidth(colWidth - 16)
+        end
+        if cell.scrollBar then
+            cell.scrollBar:Hide()
+        end
         cell:ClearAllPoints()
         cell:SetPoint("TOPLEFT", LFbidFrame, "TOPLEFT", startX, startY)
 
+        local totalRolls = table.getn(grouped.ROLLS)
+        UpdateBidListScrollBar(totalRolls)
+
         local lines = {}
-        for _, bid in ipairs(grouped.ROLLS) do
-            table.insert(lines, tostring(bid.name or "") .. " - " .. tostring(bid.points or ""))
+        local startIndex = lfbid_bidListScrollOffset + 1
+        local endIndex = lfbid_bidListScrollOffset + LFBID_ROLL_VISIBLE_ROWS
+        for idx = startIndex, endIndex do
+            local bid = grouped.ROLLS[idx]
+            if bid then
+                table.insert(lines, tostring(bid.name or "") .. " - " .. tostring(bid.points or ""))
+            end
         end
         if table.getn(lines) == 0 then
             lines[1] = "-"
         end
+
+        cell:SetHeight(cellHeight)
 
         cell.label:SetText(specs[1])
         cell.text:SetText(table.concat(lines, "\n"))
@@ -764,8 +950,12 @@ RefreshLFBidBidList = function()
             end
         end
 
-        LFbidFrame:SetHeight(198 + cellGapY)
+        LFbidFrame:SetHeight(frameTopOffset + cellHeight + frameBottomPadding)
         return
+    end
+
+    if LFbidFrame.bidScrollBar then
+        LFbidFrame.bidScrollBar:Hide()
     end
 
     local specs = {"MS", "OS"}
@@ -816,11 +1006,66 @@ RefreshLFBidBidList = function()
     end
 
     local neededCells = table.getn(specs)
-    local colWidth = 200
+    local colWidth = 191
     local cellGapX = 10
     local cellGapY = 8
     local startX = 10
-    local startY = -58
+    local startY = -76
+    local frameTopOffset = 76
+    local frameBottomPadding = 40
+    local rowHeights = {}
+    local specCellHeight = {}
+    local specLines = {}
+    local fixedCellHeight = GetFixedBidCellHeight(LFBID_POINTS_VISIBLE_ROWS)
+    local specMaxOffsets = {}
+
+    for _, spec in ipairs(specs) do
+        local entryCount = table.getn(grouped[spec] or {})
+        local maxOffset = entryCount - LFBID_POINTS_VISIBLE_ROWS
+        if maxOffset < 0 then
+            maxOffset = 0
+        end
+
+        local offset = tonumber(lfbid_specScrollOffsets[spec]) or 0
+        if offset < 0 then
+            offset = 0
+        elseif offset > maxOffset then
+            offset = maxOffset
+        end
+
+        lfbid_specScrollOffsets[spec] = offset
+        specMaxOffsets[spec] = maxOffset
+    end
+
+    for _, spec in ipairs(specs) do
+        local lines = {}
+        local bidList = grouped[spec] or {}
+        local startIndex = (lfbid_specScrollOffsets[spec] or 0) + 1
+        local endIndex = (lfbid_specScrollOffsets[spec] or 0) + LFBID_POINTS_VISIBLE_ROWS
+        for idx = startIndex, endIndex do
+            local bid = bidList[idx]
+            if bid then
+                local pointsText = tostring(bid.points or "")
+                local nameText = tostring(bid.name or "")
+                if IsUnknownZeroBid(bid) then
+                    nameText = "|cff33aaff" .. nameText .. "|r"
+                elseif not BidHasEnoughDKP(bid) then
+                    nameText = "|cffff2020" .. nameText .. "|r"
+                end
+                local line = pointsText .. " -- " .. nameText
+                if bid.altBid then
+                    line = pointsText .. " - ALT - " .. nameText
+                end
+                table.insert(lines, line)
+            end
+        end
+        if table.getn(lines) == 0 then
+            lines[1] = "-"
+        end
+
+        specLines[spec] = lines
+        specCellHeight[spec] = fixedCellHeight
+    end
 
     for index = 1, neededCells do
         local spec = specs[index]
@@ -828,7 +1073,6 @@ RefreshLFBidBidList = function()
         if not cell then
             cell = CreateFrame("Frame", nil, LFbidFrame)
             cell:SetWidth(colWidth)
-            cell:SetHeight(100)
             cell:SetBackdrop({
                 bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
                 edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -843,63 +1087,166 @@ RefreshLFBidBidList = function()
 
             cell.text = cell:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
             cell.text:SetPoint("TOPLEFT", cell.label, "BOTTOMLEFT", 0, -2)
-            cell.text:SetWidth(colWidth - 16)
+            cell.text:SetWidth(colWidth - 30)
             cell.text:SetJustifyH("LEFT")
 
             LFbidFrame.gridCells[index] = cell
         end
 
-        local col
-        local modFunc = mod
-        if not modFunc and math and math.fmod then
-            modFunc = math.fmod
-        end
-        if modFunc then
-            col = modFunc(index - 1, 2)
-        else
-            col = (index - 1) - (math.floor((index - 1) / 2) * 2)
-        end
-        local row = math.floor((index - 1) / 2)
-        local x = startX + (col * (colWidth + cellGapX))
-        local y = startY - (row * (100 + cellGapY))
-        cell:ClearAllPoints()
-        cell:SetPoint("TOPLEFT", LFbidFrame, "TOPLEFT", x, y)
+        AttachSpecScrollBar(cell)
 
-        local lines = {}
-        local bidList = grouped[spec] or {}
-        for _, bid in ipairs(bidList) do
-            local pointsText = tostring(bid.points or "")
-            local nameText = tostring(bid.name or "")
-            if IsUnknownZeroBid(bid) then
-                nameText = "|cff33aaff" .. nameText .. "|r"
-            elseif not BidHasEnoughDKP(bid) then
-                nameText = "|cffff2020" .. nameText .. "|r"
-            end
-            local line = pointsText .. " -- " .. nameText
-            table.insert(lines, line)
+        cell:SetWidth(colWidth)
+        if cell.text then
+            cell.text:SetWidth(colWidth - 30)
         end
-        if table.getn(lines) == 0 then
-            lines[1] = "-"
+        cell:SetHeight(specCellHeight[spec] or 100)
+        cell.specKey = spec
+
+        if cell.scrollBar then
+            local maxOffset = specMaxOffsets[spec] or 0
+            local offset = lfbid_specScrollOffsets[spec] or 0
+            cell.scrollBar:SetMinMaxValues(0, maxOffset)
+            cell.scrollBar:SetValueStep(1)
+            cell.scrollBar:SetValue(offset)
+            if maxOffset > 0 then
+                cell.scrollBar:Show()
+            else
+                cell.scrollBar:Hide()
+            end
+        end
+
+        local row = math.floor((index - 1) / 2)
+        local rowIndex = row + 1
+        local targetHeight = specCellHeight[spec] or 100
+        if not rowHeights[rowIndex] or targetHeight > rowHeights[rowIndex] then
+            rowHeights[rowIndex] = targetHeight
         end
 
         cell.label:SetText(spec)
-        cell.text:SetText(table.concat(lines, "\n"))
+        cell.text:SetText(table.concat(specLines[spec], "\n"))
         cell:Show()
+    end
+
+    local rowCount = math.ceil(neededCells / 2)
+    local currentY = startY
+    for rowIndex = 1, rowCount do
+        local rowTopY = currentY
+        for col = 0, 1 do
+            local index = ((rowIndex - 1) * 2) + col + 1
+            if index <= neededCells then
+                local x = startX + (col * (colWidth + cellGapX))
+                local cell = LFbidFrame.gridCells[index]
+                if cell then
+                    cell:ClearAllPoints()
+                    cell:SetPoint("TOPLEFT", LFbidFrame, "TOPLEFT", x, rowTopY)
+                end
+            end
+        end
+
+        local rowHeight = rowHeights[rowIndex] or 100
+        currentY = currentY - rowHeight - cellGapY
     end
 
     local existingCells = table.getn(LFbidFrame.gridCells)
     for index = neededCells + 1, existingCells do
         local cell = LFbidFrame.gridCells[index]
         if cell then
+            if cell.scrollBar then
+                cell.scrollBar:Hide()
+            end
             cell:Hide()
         end
     end
 
-    local rows = math.ceil(neededCells / 2)
-    if rows < 1 then
-        rows = 1
+    local totalGridHeight = 0
+    if rowCount < 1 then
+        rowCount = 1
     end
-    LFbidFrame:SetHeight(90 + rows * (100 + cellGapY))
+    for rowIndex = 1, rowCount do
+        totalGridHeight = totalGridHeight + (rowHeights[rowIndex] or 100)
+    end
+    if rowCount > 1 then
+        totalGridHeight = totalGridHeight + ((rowCount - 1) * cellGapY)
+    end
+
+    LFbidFrame:SetHeight(frameTopOffset + totalGridHeight + frameBottomPadding)
+end
+
+local function RunLFBidRollTestSimulation(requestedCount)
+    local count = tonumber(requestedCount) or 40
+    if count < 1 then
+        count = 1
+    elseif count > 200 then
+        count = 200
+    end
+
+    local testItem = "[LFBid Test Item]"
+    lfbid_activeItem = testItem
+    lfbid_openItemLink = ""
+    lfbid_biddingOpen = true
+    lfbid_bidMode = "roll"
+    lfbid_rollSeen = {}
+
+    OpenLFBidWindow(testItem, "roll")
+
+    lfbid_bids = {}
+    local randomFunc
+    if math and math.random then
+        randomFunc = math.random
+    elseif random then
+        randomFunc = random
+    end
+
+    for idx = 1, count do
+        local rollValue = 1
+        if randomFunc then
+            rollValue = randomFunc(1, 100)
+        end
+
+        table.insert(lfbid_bids, {
+            name = "TestRoller" .. tostring(idx),
+            points = rollValue,
+            spec = "ROLLS",
+        })
+    end
+
+    RefreshLFBidBidList()
+    print("LFBid: Simulated " .. tostring(count) .. " rolls in the ML frame.")
+end
+
+local function RunLFBidPointsTestSimulation()
+    local testItem = "[LFBid Test Bids]"
+    local specs = {"MS", "OS", "T-MOG"}
+
+    lfbid_activeItem = testItem
+    lfbid_openItemLink = testItem
+    lfbid_biddingOpen = false
+    lfbid_bidMode = "points"
+    lfbid_rollSeen = {}
+
+    OpenLFBidWindow(testItem, "points")
+
+    lfbid_bids = {}
+    lfbid_specScrollOffsets = {}
+
+    for specIndex, spec in ipairs(specs) do
+        for idx = 1, 11 do
+            local basePoints = 130 - (idx * 4)
+            local adjustedPoints = basePoints - ((specIndex - 1) * 3)
+            if adjustedPoints < 1 then
+                adjustedPoints = 1
+            end
+
+            table.insert(lfbid_bids, {
+                name = "Test" .. spec .. idx,
+                points = adjustedPoints,
+                spec = spec,
+            })
+        end
+    end
+
+    RefreshLFBidBidList()
+    print("LFBid: Simulated 11 bids each for MS, OS, and T-MOG.")
 end
 
 local function LFBidOpenDropDown_OnClick()
@@ -928,8 +1275,8 @@ local function LFBidOpenDropDown_Initialize(frame, level)
     UIDropDownMenu_AddButton(info, level)
 
     info = UIDropDownMenu_CreateInfo()
-    info.text = "Alt"
-    info.value = "Alt"
+    info.text = "T-MOG"
+    info.value = "T-MOG"
     info.func = LFBidOpenDropDown_OnClick
     UIDropDownMenu_AddButton(info, level)
 end
@@ -1036,6 +1383,18 @@ local function OpenLFBidOpenWindow()
         UIDropDownMenu_SetSelectedValue(lfbid_openFrame.dropDown, lfbid_openType)
         UIDropDownMenu_SetText(lfbid_openType, lfbid_openFrame.dropDown)
 
+        lfbid_openFrame.altCheck = CreateFrame("CheckButton", "LFBidOpenAltCheckButton", lfbid_openFrame, "UICheckButtonTemplate")
+        lfbid_openFrame.altCheck:SetPoint("LEFT", lfbid_openFrame.dropDown, "RIGHT", 6, -1)
+        lfbid_openFrame.altCheck:SetWidth(24)
+        lfbid_openFrame.altCheck:SetHeight(24)
+        lfbid_openFrame.altCheck:SetChecked(lfbid_openAltBid and 1 or nil)
+        lfbid_openFrame.altCheck:SetScript("OnClick", function()
+            lfbid_openAltBid = this:GetChecked() and true or false
+        end)
+        if getglobal("LFBidOpenAltCheckButtonText") then
+            getglobal("LFBidOpenAltCheckButtonText"):SetText("ALT")
+        end
+
         lfbid_openFrame.closeBtn = CreateFrame("Button", nil, lfbid_openFrame, "UIPanelButtonTemplate")
         lfbid_openFrame.closeBtn:SetWidth(24)
         lfbid_openFrame.closeBtn:SetHeight(24)
@@ -1066,7 +1425,16 @@ local function OpenLFBidOpenWindow()
                 points = tostring(lfbid_openFrame.pointsEditBox:GetText() or "")
             end
             local spec = lfbid_openType or ""
+            local useAltTag = false
+            if lfbid_openFrame.altCheck then
+                useAltTag = lfbid_openFrame.altCheck:GetChecked() and true or false
+            end
+            lfbid_openAltBid = useAltTag
+
             local msg = playerName .. " " .. points .. " " .. spec
+            if useAltTag then
+                msg = msg .. " ALT"
+            end
             local method, masterId = GetLootMethod()
             local lootMasterName
             if method == "master" then
@@ -1104,6 +1472,14 @@ local function OpenLFBidOpenWindow()
 
     UIDropDownMenu_SetSelectedValue(lfbid_openFrame.dropDown, lfbid_openType)
     UIDropDownMenu_SetText(lfbid_openType, lfbid_openFrame.dropDown)
+
+    if IsPlayerGuildRankAlt() then
+        lfbid_openAltBid = true
+    end
+
+    if lfbid_openFrame.altCheck then
+        lfbid_openFrame.altCheck:SetChecked(lfbid_openAltBid and 1 or nil)
+    end
     if lfbid_openFrame.itemText then
         if lfbid_openItemLink and lfbid_openItemLink ~= "" then
             lfbid_openFrame.itemText:SetText(lfbid_openItemLink)
@@ -1684,7 +2060,7 @@ local function OpenLFBidOptionsWindow()
     lfbid_optionsFrame:Show()
 end
 
-local function OpenLFBidWindow(itemLink, bidMode)
+OpenLFBidWindow = function(itemLink, bidMode)
     -- create the frame only once
     if not LFbidFrame then
         LFbidFrame = CreateFrame("Frame", "LFbidFrame", UIParent)
@@ -1710,7 +2086,7 @@ local function OpenLFBidWindow(itemLink, bidMode)
         end)
 
         LFbidFrame.alphaSlider = CreateFrame("Slider", "LFBidMasterAlphaSlider", LFbidFrame, "OptionsSliderTemplate")
-        LFbidFrame.alphaSlider:SetWidth(130)
+        LFbidFrame.alphaSlider:SetWidth(105)
         LFbidFrame.alphaSlider:SetHeight(14)
         LFbidFrame.alphaSlider:SetPoint("TOPLEFT", LFbidFrame, "TOPLEFT", 12, -16)
         LFbidFrame.alphaSlider:SetMinMaxValues(0.05, 0.90)
@@ -1739,7 +2115,7 @@ local function OpenLFBidWindow(itemLink, bidMode)
         LFbidFrame.startBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
         LFbidFrame.startBtn:SetWidth(90)
         LFbidFrame.startBtn:SetHeight(24)
-        LFbidFrame.startBtn:SetPoint("TOP", LFbidFrame, "TOP", -48, -6)
+        LFbidFrame.startBtn:SetPoint("TOP", LFbidFrame, "TOP", -48, -28)
         LFbidFrame.startBtn:SetText("Start Bid")
         LFbidFrame.startBtn:SetScript("OnClick", function()
             StartPointsBiddingFromMasterWindow()
@@ -1749,7 +2125,7 @@ local function OpenLFBidWindow(itemLink, bidMode)
         LFbidFrame.stopBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
         LFbidFrame.stopBtn:SetWidth(90)
         LFbidFrame.stopBtn:SetHeight(24)
-        LFbidFrame.stopBtn:SetPoint("TOP", LFbidFrame, "TOP", 48, -6)
+        LFbidFrame.stopBtn:SetPoint("TOP", LFbidFrame, "TOP", 48, -28)
         LFbidFrame.stopBtn:SetText("Stop Bids")
             LFbidFrame.stopBtn:SetScript("OnClick", function()
                 CloseBidding()
@@ -1758,7 +2134,7 @@ local function OpenLFBidWindow(itemLink, bidMode)
         LFbidFrame.dkpCheckBox = CreateFrame("CheckButton", "LFBidUseDKPCheckBox", LFbidFrame, "UICheckButtonTemplate")
         LFbidFrame.dkpCheckBox:SetWidth(24)
         LFbidFrame.dkpCheckBox:SetHeight(24)
-        LFbidFrame.dkpCheckBox:SetPoint("TOPRIGHT", LFbidFrame, "TOPRIGHT", -28, -8)
+        LFbidFrame.dkpCheckBox:SetPoint("TOPRIGHT", LFbidFrame, "TOPRIGHT", -28, -28)
         LFbidFrame.dkpCheckBox:SetChecked(lfbid_useDKPCheck)
         LFbidFrame.dkpCheckBox:SetScript("OnClick", function()
             lfbid_useDKPCheck = this:GetChecked() and 1 or nil
@@ -1772,13 +2148,13 @@ local function OpenLFBidWindow(itemLink, bidMode)
 
         LFbidFrame.text = LFbidFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         if LFbidFrame.text then
-            LFbidFrame.text:SetPoint("TOP", LFbidFrame, "TOP", 0, -34)
+            LFbidFrame.text:SetPoint("TOP", LFbidFrame, "TOP", 0, -52)
         end
 
         LFbidFrame.itemLinkButton = CreateFrame("Button", nil, LFbidFrame)
         LFbidFrame.itemLinkButton:SetWidth(380)
         LFbidFrame.itemLinkButton:SetHeight(18)
-        LFbidFrame.itemLinkButton:SetPoint("TOP", LFbidFrame, "TOP", 0, -34)
+        LFbidFrame.itemLinkButton:SetPoint("TOP", LFbidFrame, "TOP", 0, -52)
         LFbidFrame.itemLinkButton.itemLink = nil
         local mlItemButton = LFbidFrame.itemLinkButton
         LFbidFrame.itemLinkButton:SetScript("OnEnter", function()
@@ -1792,6 +2168,132 @@ local function OpenLFBidWindow(itemLink, bidMode)
         end)
 
         LFbidFrame.gridCells = {}
+
+        LFbidFrame.bidScrollBar = CreateFrame("Slider", "LFBidMasterBidScrollBar", LFbidFrame)
+        LFbidFrame.bidScrollBar:SetPoint("TOPRIGHT", LFbidFrame, "TOPRIGHT", -8, -76)
+        LFbidFrame.bidScrollBar:SetPoint("BOTTOMRIGHT", LFbidFrame, "BOTTOMRIGHT", -8, 40)
+        LFbidFrame.bidScrollBar:SetWidth(14)
+        if LFbidFrame.bidScrollBar.SetOrientation then
+            LFbidFrame.bidScrollBar:SetOrientation("VERTICAL")
+        end
+        LFbidFrame.bidScrollBar:SetMinMaxValues(0, 0)
+        LFbidFrame.bidScrollBar:SetValueStep(1)
+        LFbidFrame.bidScrollBar:SetValue(0)
+        LFbidFrame.bidScrollBar:SetThumbTexture("Interface\\Buttons\\UI-ScrollBar-Knob")
+        LFbidFrame.bidScrollBar:SetBackdrop({
+            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 12, edgeSize = 12,
+            insets = { left = 3, right = 3, top = 3, bottom = 3 }
+        })
+        LFbidFrame.bidScrollBar:SetBackdropColor(0, 0, 0, 0.25)
+        LFbidFrame.bidScrollBar:SetScript("OnValueChanged", function()
+            local value = tonumber(arg1) or 0
+            if value < 0 then
+                value = 0
+            end
+
+            local nextOffset = math.floor(value + 0.5)
+            if nextOffset > lfbid_bidListMaxOffset then
+                nextOffset = lfbid_bidListMaxOffset
+            elseif nextOffset < 0 then
+                nextOffset = 0
+            end
+
+            if nextOffset ~= lfbid_bidListScrollOffset then
+                lfbid_bidListScrollOffset = nextOffset
+                RefreshLFBidBidList()
+            end
+        end)
+        LFbidFrame.bidScrollBar:Hide()
+
+        if LFbidFrame.EnableMouseWheel then
+            LFbidFrame:EnableMouseWheel(true)
+            LFbidFrame:SetScript("OnMouseWheel", function()
+                if not lfbid_windowOpen then
+                    return
+                end
+
+                local delta = arg1 or 0
+                if delta == 0 then
+                    return
+                end
+
+                if lfbid_bidMode ~= "roll" then
+                    local targetSpec = nil
+                    if lfbid_hoveredSpec and lfbid_hoveredSpec ~= "" then
+                        targetSpec = lfbid_hoveredSpec
+                    end
+
+                    if (not targetSpec or targetSpec == "") and LFbidFrame.gridCells then
+                        for _, cell in ipairs(LFbidFrame.gridCells) do
+                            if cell and cell:IsShown() and cell.specKey and cell.scrollBar and cell.scrollBar:IsShown() then
+                                targetSpec = cell.specKey
+                                break
+                            end
+                        end
+                    end
+
+                    if not targetSpec or targetSpec == "" then
+                        return
+                    end
+
+                    local specKey = targetSpec
+                    local totalForSpec = 0
+                    for _, bid in ipairs(lfbid_bids) do
+                        if bid and NormalizeSpec(bid.spec) == specKey then
+                            totalForSpec = totalForSpec + 1
+                        end
+                    end
+
+                    local maxOffset = totalForSpec - LFBID_POINTS_VISIBLE_ROWS
+                    if maxOffset < 0 then
+                        maxOffset = 0
+                    end
+                    if maxOffset == 0 then
+                        return
+                    end
+
+                    local currentOffset = tonumber(lfbid_specScrollOffsets[specKey]) or 0
+                    local nextOffset = currentOffset
+                    if delta > 0 then
+                        nextOffset = nextOffset - 1
+                    else
+                        nextOffset = nextOffset + 1
+                    end
+
+                    if nextOffset < 0 then
+                        nextOffset = 0
+                    elseif nextOffset > maxOffset then
+                        nextOffset = maxOffset
+                    end
+
+                    if nextOffset ~= currentOffset then
+                        lfbid_specScrollOffsets[specKey] = nextOffset
+                        RefreshLFBidBidList()
+                    end
+                    return
+                end
+
+                local nextOffset = lfbid_bidListScrollOffset
+                if delta > 0 then
+                    nextOffset = nextOffset - 1
+                else
+                    nextOffset = nextOffset + 1
+                end
+
+                if nextOffset < 0 then
+                    nextOffset = 0
+                elseif nextOffset > lfbid_bidListMaxOffset then
+                    nextOffset = lfbid_bidListMaxOffset
+                end
+
+                if nextOffset ~= lfbid_bidListScrollOffset then
+                    lfbid_bidListScrollOffset = nextOffset
+                    RefreshLFBidBidList()
+                end
+            end)
+        end
 
         -- Close button (top right)
         LFbidFrame.closeBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
@@ -1817,6 +2319,10 @@ local function OpenLFBidWindow(itemLink, bidMode)
     lfbid_bidMode = bidMode or "points"
     lfbid_bids = {}
     lfbid_rollSeen = {}
+    lfbid_bidListScrollOffset = 0
+    lfbid_bidListMaxOffset = 0
+    lfbid_specScrollOffsets = {}
+    lfbid_hoveredSpec = nil
     if LFbidFrame.dkpCheckBox then
         LFbidFrame.dkpCheckBox:SetChecked(lfbid_useDKPCheck)
     end
@@ -1926,7 +2432,7 @@ if not lfbid_whisperFrame then
             end
         end
 
-        local finalName, points, spec = ParseBidMessage(msg, sender)
+        local finalName, points, spec, altBid = ParseBidMessage(msg, sender)
         
         if finalName and points ~= nil and spec then
             RemoveExistingBidForPlayer(finalName)
@@ -1934,7 +2440,8 @@ if not lfbid_whisperFrame then
             table.insert(lfbid_bids, {
                 name = finalName,
                 points = points,
-                spec = spec
+                spec = spec,
+                altBid = altBid and true or false,
             })
             RefreshLFBidBidList()
         else
@@ -2074,7 +2581,7 @@ local function HandleLFBidSlash(msg)
         OpenLFBidOpenWindow()
     elseif cmd == "options" then
         if not IsPlayerMasterLooter() and not IsPlayerFounderOrBanker() then
-            print("LFBid: /lfbid options is only available to the Master Looter.")
+            print("LFBid: /lfbid options is only available to the Master Looter, Founder, or Banker.")
             return
         end
         if lfbid_optionsWindowOpen then
@@ -2082,6 +2589,10 @@ local function HandleLFBidSlash(msg)
             return
         end
         OpenLFBidOptionsWindow()
+    elseif cmd == "test" then
+        RunLFBidRollTestSimulation(rest)
+    elseif cmd == "testbid" then
+        RunLFBidPointsTestSimulation()
     else
         print("LFbid commands:\n  /lfbid start <itemlink>\n  /lfbid roll <itemlink>\n  /lfbid open\n  /lfbid options")
     end
