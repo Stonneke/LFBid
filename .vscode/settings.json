@@ -23,6 +23,9 @@
         "UIDropDownMenu_Initialize",
         "HandleModifiedItemClick",
         "DressUpItemLink",
-        "ChatFrame_OpenChat"
+        "ChatFrame_OpenChat",
+        "FauxScrollFrame_Update",
+        "FauxScrollFrame_OnVerticalScroll",
+        "FauxScrollFrame_GetOffset"
     ]
 }

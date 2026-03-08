@@ -53,34 +53,87 @@ end
 print("LFBid loaded. Use /lfbid for commands.")
 
 
+local function NormalizeBidderName(name)
+    local text = tostring(name or "")
+    text = string.gsub(text, "^%s+", "")
+    text = string.gsub(text, "%s+$", "")
+    local dashPos = string.find(text, "-")
+    if dashPos and dashPos > 1 then
+        text = string.sub(text, 1, dashPos - 1)
+    end
+    return text
+end
+
 local function ParseBidMessage(msg, fallbackName)
-    if not msg or msg == "" then
+    local text = tostring(msg or "")
+    text = string.gsub(text, "^%s+", "")
+    text = string.gsub(text, "%s+$", "")
+    if text == "" then
         return nil, nil, nil, false
     end
 
-    local parsedName, points, spec, altBid
-    local space1 = string.find(msg, " ")
-    if space1 then
-        parsedName = string.sub(msg, 1, space1 - 1)
-        local rest = string.sub(msg, space1 + 1)
-        local space2 = string.find(rest, " ")
-        if space2 then
-            points = tonumber(string.sub(rest, 1, space2 - 1))
-            local specPart = string.sub(rest, space2 + 1)
-            local space3 = string.find(specPart, " ")
-            if space3 then
-                spec = string.sub(specPart, 1, space3 - 1)
-                local altMarker = string.sub(specPart, space3 + 1)
-                if altMarker and string.lower(tostring(altMarker)) == "alt" then
-                    altBid = true
-                end
-            else
-                spec = specPart
-            end
+    local tokens = {}
+    local tokenIter = string.gfind or string.gmatch
+    for token in tokenIter(text, "%S+") do
+        table.insert(tokens, token)
+    end
+    if table.getn(tokens) < 2 then
+        return nil, nil, nil, false
+    end
+
+    local altBid = false
+    local lastToken = tokens[table.getn(tokens)]
+    if lastToken and string.lower(lastToken) == "alt" then
+        altBid = true
+        table.remove(tokens)
+    end
+
+    if table.getn(tokens) < 2 then
+        return nil, nil, nil, false
+    end
+
+    local points
+    local spec
+    local parsedName
+
+    local token1 = tokens[1]
+    local token2 = tokens[2]
+    local token1Number = tonumber(token1)
+    local token2Number = tonumber(token2)
+
+    -- Preferred input formats: "<points> <spec>" or "<spec> <points>".
+    if token1Number and not token2Number then
+        points = token1Number
+        spec = token2
+    elseif token2Number and not token1Number then
+        points = token2Number
+        spec = token1
+    end
+
+    -- Backward compatibility for old format with explicit player name in payload.
+    if not points and table.getn(tokens) >= 3 then
+        local token3 = tokens[3]
+        local token3Number = tonumber(token3)
+        if token2Number and not token3Number then
+            parsedName = token1
+            points = token2Number
+            spec = token3
+        elseif token3Number and not token2Number then
+            parsedName = token1
+            points = token3Number
+            spec = token2
         end
     end
 
-    local finalName = parsedName or fallbackName
+    local finalName = NormalizeBidderName(fallbackName)
+    if finalName == "" then
+        finalName = NormalizeBidderName(parsedName)
+    end
+
+    if finalName == "" or points == nil or not spec or spec == "" then
+        return nil, nil, nil, false
+    end
+
     return finalName, points, spec, altBid and true or false
 end
 
@@ -1419,7 +1472,6 @@ local function OpenLFBidOpenWindow()
                 return
             end
 
-            local playerName = UnitName("player") or "Player"
             local points = ""
             if lfbid_openFrame.pointsEditBox then
                 points = tostring(lfbid_openFrame.pointsEditBox:GetText() or "")
@@ -1431,7 +1483,7 @@ local function OpenLFBidOpenWindow()
             end
             lfbid_openAltBid = useAltTag
 
-            local msg = playerName .. " " .. points .. " " .. spec
+            local msg = points .. " " .. spec
             if useAltTag then
                 msg = msg .. " ALT"
             end
@@ -2359,10 +2411,6 @@ if not lfbid_whisperFrame then
     lfbid_whisperFrame:RegisterEvent("CHAT_MSG_ADDON")
     lfbid_whisperFrame:RegisterEvent("CHAT_MSG_SYSTEM")
     lfbid_whisperFrame:SetScript("OnEvent", function(_, eventName, p1, p2, p3, p4)
-        if not lfbid_windowOpen then
-            return
-        end
-
         local evt = eventName or event
         if evt == "CHAT_MSG_SYSTEM" then
             if not lfbid_biddingOpen or lfbid_bidMode ~= "roll" then
@@ -2385,7 +2433,9 @@ if not lfbid_whisperFrame then
                 points = rollValue,
                 spec = "ROLL",
             })
-            RefreshLFBidBidList()
+            if lfbid_windowOpen then
+                RefreshLFBidBidList()
+            end
             return
         end
 
@@ -2443,7 +2493,9 @@ if not lfbid_whisperFrame then
                 spec = spec,
                 altBid = altBid and true or false,
             })
-            RefreshLFBidBidList()
+            if lfbid_windowOpen then
+                RefreshLFBidBidList()
+            end
         else
             print("LFBid: Failed to parse " .. sourceType .. " bid from " .. (sender or "unknown") .. ": " .. (msg or "no message"))
         end
