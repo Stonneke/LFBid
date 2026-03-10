@@ -12,6 +12,7 @@ local lfbid_dkpSheetFrame
 local lfbid_dkpSheetWindowOpen = false
 local lfbid_dkpSheetScrollOffset = 0
 local lfbid_openType = "MS"
+local lfbid_mlBidType = "MS"
 local lfbid_openItemLink = ""
 local lfbid_biddingOpen = false
 local lfbid_bidMode = "points"
@@ -30,6 +31,7 @@ local lfbid_hoveredSpec = nil
 local lfbid_openAltBid = false
 local LFBID_ROLL_VISIBLE_ROWS = 10
 local LFBID_POINTS_VISIBLE_ROWS = 6
+local lfbid_pendingWinnerAnnouncement = nil
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
@@ -646,6 +648,124 @@ local function StartLFBidMessageTimer(messages, intervalOrIntervals, onDone)
     lfbid_timerFrame:Show()
 end
 
+local function ResolvePointsAuctionOutcome()
+    local buckets = {
+        ["MS"] = {},
+        ["OS"] = {},
+        ["T-MOG"] = {},
+    }
+    local priority = {"MS", "OS", "T-MOG"}
+
+    for _, bid in ipairs(lfbid_bids) do
+        local spec = NormalizeSpec(bid and bid.spec)
+        local points = tonumber(bid and bid.points)
+        if buckets[spec] and points then
+            table.insert(buckets[spec], {
+                name = tostring(bid.name or ""),
+                points = points,
+                spec = spec,
+            })
+        end
+    end
+
+    local selectedSpec = nil
+    local selectedBids = nil
+    for _, spec in ipairs(priority) do
+        if table.getn(buckets[spec]) > 0 then
+            selectedSpec = spec
+            selectedBids = buckets[spec]
+            break
+        end
+    end
+
+    if not selectedSpec or not selectedBids then
+        return nil
+    end
+
+    table.sort(selectedBids, function(a, b)
+        if a.points ~= b.points then
+            return a.points > b.points
+        end
+        return string.lower(tostring(a.name or "")) < string.lower(tostring(b.name or ""))
+    end)
+
+    local winner = selectedBids[1]
+    if not winner or winner.name == "" then
+        return nil
+    end
+
+    local cost = 1
+    if table.getn(selectedBids) >= 2 then
+        local secondBid = tonumber(selectedBids[2].points) or 0
+        cost = secondBid + 1
+    end
+    if cost < 1 then
+        cost = 1
+    end
+
+    return {
+        winnerName = winner.name,
+        winnerSpec = selectedSpec,
+        winnerBid = tonumber(winner.points) or 0,
+        cost = cost,
+        itemLink = tostring(lfbid_activeItem or ""),
+    }
+end
+
+local function SendWinnerAnnouncement(outcome)
+    if not outcome then
+        return
+    end
+
+    local itemText = tostring(outcome.itemLink or "")
+    if itemText == "" then
+        itemText = ItemTextForAnnouncement(outcome.itemLink)
+    end
+    local message
+    if itemText and itemText ~= "" then
+        message = itemText .. " won by " .. tostring(outcome.winnerName) .. " for " .. tostring(outcome.cost) .. " DKP"
+    else
+        message = tostring(outcome.winnerName) .. " won for " .. tostring(outcome.cost) .. " DKP"
+    end
+
+    if GetNumRaidMembers and GetNumRaidMembers() and GetNumRaidMembers() > 0 then
+        SendSafeChatMessage(message, "RAID_WARNING")
+        return
+    end
+
+    if GetNumPartyMembers and GetNumPartyMembers() and GetNumPartyMembers() > 0 then
+        SendSafeChatMessage(message, "PARTY")
+        return
+    end
+
+    print("LFBid: " .. message)
+end
+
+local function EnsureWinnerConfirmPopupRegistered()
+    StaticPopupDialogs = StaticPopupDialogs or {}
+    if StaticPopupDialogs["LFBID_CONFIRM_WINNER_ANNOUNCE"] then
+        return
+    end
+
+    StaticPopupDialogs["LFBID_CONFIRM_WINNER_ANNOUNCE"] = {
+        text = "%s",
+        button1 = "Yes",
+        button2 = "No",
+        OnAccept = function()
+            if lfbid_pendingWinnerAnnouncement then
+                SendWinnerAnnouncement(lfbid_pendingWinnerAnnouncement)
+            end
+            lfbid_pendingWinnerAnnouncement = nil
+        end,
+        OnCancel = function()
+            lfbid_pendingWinnerAnnouncement = nil
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+end
+
 local function CloseBidding()
     if not lfbid_biddingOpen then
         print("LFBid: Bidding is not active.")
@@ -703,11 +823,35 @@ local function CloseBidding()
     end
 
     StartLFBidMessageTimer(messages, intervals, function()
+        local pointsOutcome = nil
+        if lfbid_bidMode == "points" then
+            pointsOutcome = ResolvePointsAuctionOutcome()
+        end
+
         lfbid_biddingOpen = false
         lfbid_rollSeen = {}
         SendBiddingCloseMessage()
         if RefreshMasterLootButtons then
             RefreshMasterLootButtons()
+        end
+
+        if lfbid_bidMode == "points" then
+            if pointsOutcome then
+                if IsPlayerMasterLooter() then
+                    EnsureWinnerConfirmPopupRegistered()
+                    lfbid_pendingWinnerAnnouncement = pointsOutcome
+                    local confirmText = tostring(pointsOutcome.winnerName) .. " won for " .. tostring(pointsOutcome.cost) .. " DKP, announce?"
+                    if StaticPopup_Show then
+                        StaticPopup_Show("LFBID_CONFIRM_WINNER_ANNOUNCE", confirmText)
+                    else
+                        print("LFBid: " .. confirmText)
+                    end
+                else
+                    print("LFBid: Winner is " .. tostring(pointsOutcome.winnerName) .. " for " .. tostring(pointsOutcome.cost) .. " DKP.")
+                end
+            else
+                print("LFBid: Bidding ended with no valid MS/OS/T-MOG bids.")
+            end
         end
     end)
 end
@@ -727,13 +871,68 @@ local function StartPointsBiddingFromMasterWindow()
         return
     end
 
+    local mlOpeningBidPoints = nil
+    local mlOpeningBidSpec = NormalizeSpec(lfbid_mlBidType)
+    if LFbidFrame and LFbidFrame.mlBidPointsEdit then
+        local text = tostring(LFbidFrame.mlBidPointsEdit:GetText() or "")
+        text = string.gsub(text, "^%s+", "")
+        text = string.gsub(text, "%s+$", "")
+        if text ~= "" then
+            local parsed = tonumber(text)
+            if not parsed then
+                print("LFBid: ML opening bid points must be a number.")
+                return
+            end
+            parsed = math.floor(parsed + 0.5)
+            if parsed < 0 then
+                print("LFBid: ML opening bid points cannot be negative.")
+                return
+            end
+            mlOpeningBidPoints = parsed
+        end
+    end
+
+    if mlOpeningBidPoints ~= nil then
+        local myName = string.lower(tostring(UnitName("player") or ""))
+        local hasOtherBids = false
+        for _, bid in ipairs(lfbid_bids) do
+            local bidderName = string.lower(tostring(bid and bid.name or ""))
+            if bidderName ~= "" and bidderName ~= myName then
+                hasOtherBids = true
+                break
+            end
+        end
+
+        if hasOtherBids then
+            print("LFBid: ML opening bid is only allowed before other bids come in.")
+            mlOpeningBidPoints = nil
+        end
+    end
+
     lfbid_openItemLink = lfbid_activeItem
     lfbid_biddingOpen = true
+
+    if mlOpeningBidPoints ~= nil then
+        local myName = tostring(UnitName("player") or "")
+        if myName ~= "" then
+            RemoveExistingBidForPlayer(myName)
+            table.insert(lfbid_bids, {
+                name = myName,
+                points = mlOpeningBidPoints,
+                spec = mlOpeningBidSpec,
+            })
+        end
+    end
+
     SendBiddingStartMessage(lfbid_activeItem)
     SendSafeChatMessage("Start bidding on item: " .. lfbid_activeItem, "RAID")
 
     if RefreshMasterLootButtons then
         RefreshMasterLootButtons()
+    end
+
+    if RefreshLFBidBidList then
+        RefreshLFBidBidList()
     end
 end
 
@@ -762,6 +961,47 @@ RefreshMasterLootButtons = function()
             LFbidFrame.stopBtn:Enable()
         else
             LFbidFrame.stopBtn:Disable()
+        end
+    end
+
+    if LFbidFrame.mlBidLabel then
+        if lfbid_bidMode == "points" then
+            LFbidFrame.mlBidLabel:Show()
+        else
+            LFbidFrame.mlBidLabel:Hide()
+        end
+    end
+
+    if LFbidFrame.mlBidPointsEdit then
+        if lfbid_bidMode == "points" then
+            LFbidFrame.mlBidPointsEdit:Show()
+            if lfbid_biddingOpen then
+                LFbidFrame.mlBidPointsEdit:ClearFocus()
+                LFbidFrame.mlBidPointsEdit:EnableMouse(false)
+            else
+                LFbidFrame.mlBidPointsEdit:EnableMouse(true)
+            end
+        else
+            LFbidFrame.mlBidPointsEdit:Hide()
+        end
+    end
+
+    if LFbidFrame.mlBidSpecDropDown then
+        if lfbid_bidMode == "points" then
+            LFbidFrame.mlBidSpecDropDown:Show()
+            if UIDropDownMenu_SetSelectedValue then
+                UIDropDownMenu_SetSelectedValue(LFbidFrame.mlBidSpecDropDown, lfbid_mlBidType)
+            end
+            if UIDropDownMenu_SetText then
+                UIDropDownMenu_SetText(lfbid_mlBidType, LFbidFrame.mlBidSpecDropDown)
+            end
+            if lfbid_biddingOpen and UIDropDownMenu_DisableDropDown then
+                UIDropDownMenu_DisableDropDown(LFbidFrame.mlBidSpecDropDown)
+            elseif UIDropDownMenu_EnableDropDown then
+                UIDropDownMenu_EnableDropDown(LFbidFrame.mlBidSpecDropDown)
+            end
+        else
+            LFbidFrame.mlBidSpecDropDown:Hide()
         end
     end
 end
@@ -933,8 +1173,8 @@ RefreshLFBidBidList = function()
         local neededCells = 1
         local colWidth = 392
         local startX = 10
-        local startY = -76
-        local frameTopOffset = 76
+        local startY = -118
+        local frameTopOffset = 118
         local frameBottomPadding = 40
         local cellHeight = GetFixedBidCellHeight(LFBID_ROLL_VISIBLE_ROWS)
 
@@ -1063,8 +1303,8 @@ RefreshLFBidBidList = function()
     local cellGapX = 10
     local cellGapY = 8
     local startX = 10
-    local startY = -76
-    local frameTopOffset = 76
+    local startY = -118
+    local frameTopOffset = 118
     local frameBottomPadding = 40
     local rowHeights = {}
     local specCellHeight = {}
@@ -1331,6 +1571,40 @@ local function LFBidOpenDropDown_Initialize(frame, level)
     info.text = "T-MOG"
     info.value = "T-MOG"
     info.func = LFBidOpenDropDown_OnClick
+    UIDropDownMenu_AddButton(info, level)
+end
+
+local function LFBidMLBidDropDown_OnClick()
+    local value = this and this.value
+    if not value then
+        return
+    end
+    lfbid_mlBidType = value
+    if LFbidFrame and LFbidFrame.mlBidSpecDropDown then
+        UIDropDownMenu_SetSelectedValue(LFbidFrame.mlBidSpecDropDown, value)
+        UIDropDownMenu_SetText(value, LFbidFrame.mlBidSpecDropDown)
+    end
+end
+
+local function LFBidMLBidDropDown_Initialize(frame, level)
+    local info
+
+    info = UIDropDownMenu_CreateInfo()
+    info.text = "MS"
+    info.value = "MS"
+    info.func = LFBidMLBidDropDown_OnClick
+    UIDropDownMenu_AddButton(info, level)
+
+    info = UIDropDownMenu_CreateInfo()
+    info.text = "OS"
+    info.value = "OS"
+    info.func = LFBidMLBidDropDown_OnClick
+    UIDropDownMenu_AddButton(info, level)
+
+    info = UIDropDownMenu_CreateInfo()
+    info.text = "T-MOG"
+    info.value = "T-MOG"
+    info.func = LFBidMLBidDropDown_OnClick
     UIDropDownMenu_AddButton(info, level)
 end
 
@@ -2198,15 +2472,32 @@ OpenLFBidWindow = function(itemLink, bidMode)
             getglobal("LFBidUseDKPCheckBoxText"):SetPoint("RIGHT", LFbidFrame.dkpCheckBox, "LEFT", -2, 1)
         end
 
+        LFbidFrame.mlBidLabel = LFbidFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        LFbidFrame.mlBidLabel:SetPoint("TOP", LFbidFrame, "TOP", -78, -60)
+        LFbidFrame.mlBidLabel:SetText("ML Bid")
+
+        LFbidFrame.mlBidPointsEdit = CreateFrame("EditBox", nil, LFbidFrame, "InputBoxTemplate")
+        LFbidFrame.mlBidPointsEdit:SetWidth(58)
+        LFbidFrame.mlBidPointsEdit:SetHeight(18)
+        LFbidFrame.mlBidPointsEdit:SetPoint("LEFT", LFbidFrame.mlBidLabel, "RIGHT", 8, 0)
+        LFbidFrame.mlBidPointsEdit:SetAutoFocus(false)
+
+        LFbidFrame.mlBidSpecDropDown = CreateFrame("Frame", "LFBidMasterMLBidSpecDropDown", LFbidFrame, "UIDropDownMenuTemplate")
+        LFbidFrame.mlBidSpecDropDown:SetPoint("LEFT", LFbidFrame.mlBidPointsEdit, "RIGHT", -8, -4)
+        UIDropDownMenu_SetWidth(70, LFbidFrame.mlBidSpecDropDown)
+        UIDropDownMenu_Initialize(LFbidFrame.mlBidSpecDropDown, LFBidMLBidDropDown_Initialize)
+        UIDropDownMenu_SetSelectedValue(LFbidFrame.mlBidSpecDropDown, lfbid_mlBidType)
+        UIDropDownMenu_SetText(lfbid_mlBidType, LFbidFrame.mlBidSpecDropDown)
+
         LFbidFrame.text = LFbidFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         if LFbidFrame.text then
-            LFbidFrame.text:SetPoint("TOP", LFbidFrame, "TOP", 0, -52)
+            LFbidFrame.text:SetPoint("TOP", LFbidFrame, "TOP", 0, -94)
         end
 
         LFbidFrame.itemLinkButton = CreateFrame("Button", nil, LFbidFrame)
         LFbidFrame.itemLinkButton:SetWidth(380)
         LFbidFrame.itemLinkButton:SetHeight(18)
-        LFbidFrame.itemLinkButton:SetPoint("TOP", LFbidFrame, "TOP", 0, -52)
+        LFbidFrame.itemLinkButton:SetPoint("TOP", LFbidFrame, "TOP", 0, -94)
         LFbidFrame.itemLinkButton.itemLink = nil
         local mlItemButton = LFbidFrame.itemLinkButton
         LFbidFrame.itemLinkButton:SetScript("OnEnter", function()
@@ -2222,7 +2513,7 @@ OpenLFBidWindow = function(itemLink, bidMode)
         LFbidFrame.gridCells = {}
 
         LFbidFrame.bidScrollBar = CreateFrame("Slider", "LFBidMasterBidScrollBar", LFbidFrame)
-        LFbidFrame.bidScrollBar:SetPoint("TOPRIGHT", LFbidFrame, "TOPRIGHT", -8, -76)
+        LFbidFrame.bidScrollBar:SetPoint("TOPRIGHT", LFbidFrame, "TOPRIGHT", -8, -118)
         LFbidFrame.bidScrollBar:SetPoint("BOTTOMRIGHT", LFbidFrame, "BOTTOMRIGHT", -8, 40)
         LFbidFrame.bidScrollBar:SetWidth(14)
         if LFbidFrame.bidScrollBar.SetOrientation then
@@ -2368,6 +2659,13 @@ OpenLFBidWindow = function(itemLink, bidMode)
             LFbidFrame.itemLinkButton:EnableMouse(false)
         end
     end
+    if LFbidFrame.mlBidPointsEdit then
+        LFbidFrame.mlBidPointsEdit:SetText("")
+    end
+    if LFbidFrame.mlBidSpecDropDown then
+        UIDropDownMenu_SetSelectedValue(LFbidFrame.mlBidSpecDropDown, lfbid_mlBidType)
+        UIDropDownMenu_SetText(lfbid_mlBidType, LFbidFrame.mlBidSpecDropDown)
+    end
     lfbid_bidMode = bidMode or "points"
     lfbid_bids = {}
     lfbid_rollSeen = {}
@@ -2486,7 +2784,6 @@ if not lfbid_whisperFrame then
         
         if finalName and points ~= nil and spec then
             RemoveExistingBidForPlayer(finalName)
-            print("LFBid: Received " .. sourceType .. " bid from " .. finalName .. ": " .. points .. " " .. spec)
             table.insert(lfbid_bids, {
                 name = finalName,
                 points = points,
@@ -2563,6 +2860,446 @@ lfbid_openSyncFrame:SetScript("OnEvent", function(_, eventName, p1, p2, p3, p4)
     lfbid_biddingOpen = true
     OpenLFBidOpenWindow()
 end)
+
+local lfbid_itemContextMenuFrame
+local lfbid_itemContextLink = nil
+local lfbid_originalSetItemRef = nil
+
+local function StartBiddingForItemLink(itemLink, mode)
+    local normalizedItemLink = tostring(itemLink or "")
+    if normalizedItemLink == "" then
+        print("LFBid: Could not determine item link.")
+        return
+    end
+
+    if not IsPlayerMasterLooter() then
+        print("LFBid: Starting bids from item menu is only available to the Master Looter.")
+        return
+    end
+
+    if lfbid_windowOpen then
+        print("Bidding window already open. Close it first with the X button.")
+        return
+    end
+
+    if mode == "roll" then
+        lfbid_activeItem = normalizedItemLink
+        lfbid_openItemLink = ""
+        lfbid_biddingOpen = true
+        lfbid_bidMode = "roll"
+        lfbid_rollSeen = {}
+        SendSafeChatMessage("Start rolling for item: " .. normalizedItemLink, "RAID")
+        OpenLFBidWindow(normalizedItemLink, "roll")
+        return
+    end
+
+    lfbid_activeItem = normalizedItemLink
+    lfbid_openItemLink = normalizedItemLink
+    lfbid_biddingOpen = false
+    lfbid_bidMode = "points"
+    OpenLFBidWindow(normalizedItemLink, "points")
+end
+
+local function ExtractItemLinkFromItemRef(link, text)
+    local textValue = tostring(text or "")
+    local _, _, hyperlink = string.find(textValue, "(|Hitem:.-|h%[.-%]|h)")
+    if hyperlink and hyperlink ~= "" then
+        return hyperlink
+    end
+
+    local linkValue = tostring(link or "")
+    if string.sub(linkValue, 1, 5) == "item:" then
+        local itemName = nil
+        if GetItemInfo then
+            itemName = GetItemInfo(linkValue)
+        end
+        if itemName and itemName ~= "" then
+            return "|H" .. linkValue .. "|h[" .. itemName .. "]|h"
+        end
+        return "|H" .. linkValue .. "|h[item]|h"
+    end
+
+    return nil
+end
+
+local function LFBidItemContextMenu_OnStartPoints()
+    StartBiddingForItemLink(lfbid_itemContextLink, "points")
+end
+
+local function LFBidItemContextMenu_OnStartRoll()
+    StartBiddingForItemLink(lfbid_itemContextLink, "roll")
+end
+
+local function LFBidItemContextMenu_Initialize(frame, level)
+    if not level or level ~= 1 then
+        return
+    end
+
+    local canStart = IsPlayerMasterLooter() and not lfbid_windowOpen
+
+    local info = UIDropDownMenu_CreateInfo()
+    info.isTitle = 1
+    info.notCheckable = 1
+    info.text = "LFBid"
+    UIDropDownMenu_AddButton(info, level)
+
+    info = UIDropDownMenu_CreateInfo()
+    info.text = "Start bidding (points)"
+    info.func = LFBidItemContextMenu_OnStartPoints
+    info.notCheckable = 1
+    info.disabled = canStart and nil or 1
+    UIDropDownMenu_AddButton(info, level)
+
+    info = UIDropDownMenu_CreateInfo()
+    info.text = "Start rolling (1-100)"
+    info.func = LFBidItemContextMenu_OnStartRoll
+    info.notCheckable = 1
+    info.disabled = canStart and nil or 1
+    UIDropDownMenu_AddButton(info, level)
+end
+
+local function ShowLFBidItemContextMenu(itemLink)
+    if not itemLink or itemLink == "" then
+        return
+    end
+
+    if not lfbid_itemContextMenuFrame then
+        lfbid_itemContextMenuFrame = CreateFrame("Frame", "LFBidItemContextMenuFrame", UIParent, "UIDropDownMenuTemplate")
+        UIDropDownMenu_Initialize(lfbid_itemContextMenuFrame, LFBidItemContextMenu_Initialize, "MENU")
+    end
+
+    lfbid_itemContextLink = itemLink
+    ToggleDropDownMenu(1, nil, lfbid_itemContextMenuFrame, "cursor", 0, 0)
+end
+
+local function RegisterLFBidItemRefHook()
+    if lfbid_originalSetItemRef then
+        return
+    end
+
+    lfbid_originalSetItemRef = SetItemRef
+    SetItemRef = function(link, text, button, chatFrame)
+        local clickedButton = button
+
+        if clickedButton == "RightButton" then
+            local itemLink = ExtractItemLinkFromItemRef(link, text)
+            if itemLink and itemLink ~= "" then
+                ShowLFBidItemContextMenu(itemLink)
+                return
+            end
+        end
+
+        if lfbid_originalSetItemRef then
+            return lfbid_originalSetItemRef(link, text, button, chatFrame)
+        end
+    end
+end
+
+local lfbid_lootHookFrame = nil
+local lfbid_originalLootFrameUpdate = nil
+local lfbid_masterLootDropdownHooked = false
+local lfbid_masterLootOriginalInitialize = nil
+local lfbid_masterLootMenuSlot = nil
+local lfbid_debugEnabled = false
+local lfbid_toggleDropDownHooked = false
+local lfbid_originalToggleDropDownMenu = nil
+
+local function LFBidDebug(message)
+    if not lfbid_debugEnabled then
+        return
+    end
+    print("LFBid DEBUG: " .. tostring(message or ""))
+end
+
+local function ResolveDropDownFrame(frameRef)
+    if type(frameRef) == "table" then
+        return frameRef
+    end
+    if type(frameRef) == "string" and getglobal then
+        return getglobal(frameRef)
+    end
+    return nil
+end
+
+local function IsGiveLootMenuTitle(level)
+    local lvl = tonumber(level) or 1
+    local textWidget = getglobal("DropDownList" .. tostring(lvl) .. "Button1NormalText")
+    if not textWidget or not textWidget.GetText then
+        return false
+    end
+
+    local text = tostring(textWidget:GetText() or "")
+    if text == "" then
+        return false
+    end
+
+    local lower = string.lower(text)
+    if string.find(lower, "give loot to", 1, true) then
+        return true
+    end
+
+    return false
+end
+
+local function HookLootButtonsForLFBid()
+    local maxButtons = 16
+    local index
+    for index = 1, maxButtons do
+        local button = getglobal("LootButton" .. tostring(index))
+        if button and not button.lfbidHooked then
+            button.lfbidHooked = true
+            button.lfbidOriginalOnClick = button:GetScript("OnClick")
+            button:SetScript("OnClick", function(self, mouseButton)
+                local clickedButton = mouseButton
+                local buttonFrame = self
+
+                if not clickedButton and _G then
+                    clickedButton = _G.arg1
+                end
+                if (not buttonFrame) and _G then
+                    buttonFrame = _G.this
+                end
+
+                if buttonFrame and buttonFrame.GetID then
+                    local clickedSlotId = tonumber(buttonFrame:GetID())
+                    if clickedSlotId then
+                        lfbid_masterLootMenuSlot = clickedSlotId
+                    end
+                end
+
+                if clickedButton == "RightButton" and buttonFrame and buttonFrame.GetID and GetLootSlotLink then
+                    local slotId = buttonFrame:GetID()
+                    local itemLink = GetLootSlotLink(slotId)
+                    if itemLink and itemLink ~= "" then
+                        ShowLFBidItemContextMenu(itemLink)
+                        return
+                    end
+                end
+
+                if buttonFrame and buttonFrame.lfbidOriginalOnClick then
+                    return buttonFrame.lfbidOriginalOnClick(self, mouseButton)
+                end
+            end)
+        end
+    end
+end
+
+local function RegisterLFBidLootWindowHook()
+    if lfbid_lootHookFrame then
+        return
+    end
+
+    lfbid_lootHookFrame = CreateFrame("Frame")
+    lfbid_lootHookFrame:RegisterEvent("PLAYER_LOGIN")
+    lfbid_lootHookFrame:RegisterEvent("LOOT_OPENED")
+    lfbid_lootHookFrame:SetScript("OnEvent", function()
+        HookLootButtonsForLFBid()
+    end)
+
+    if not lfbid_originalLootFrameUpdate and type(LootFrame_Update) == "function" then
+        lfbid_originalLootFrameUpdate = LootFrame_Update
+        LootFrame_Update = function()
+            local result = lfbid_originalLootFrameUpdate()
+            HookLootButtonsForLFBid()
+            return result
+        end
+    end
+
+    HookLootButtonsForLFBid()
+end
+
+local function ResolveMasterLootMenuSlot()
+    if lfbid_masterLootMenuSlot and tonumber(lfbid_masterLootMenuSlot) then
+        return tonumber(lfbid_masterLootMenuSlot)
+    end
+
+    if GroupLootDropDown then
+        if GroupLootDropDown.slot and tonumber(GroupLootDropDown.slot) then
+            return tonumber(GroupLootDropDown.slot)
+        end
+        if GroupLootDropDown.selectedSlot and tonumber(GroupLootDropDown.selectedSlot) then
+            return tonumber(GroupLootDropDown.selectedSlot)
+        end
+        if GroupLootDropDown.selectedLootSlot and tonumber(GroupLootDropDown.selectedLootSlot) then
+            return tonumber(GroupLootDropDown.selectedLootSlot)
+        end
+    end
+
+    if LootFrame and LootFrame.selectedSlot and tonumber(LootFrame.selectedSlot) then
+        return tonumber(LootFrame.selectedSlot)
+    end
+
+    if MasterLootDropDown then
+        if MasterLootDropDown.slot and tonumber(MasterLootDropDown.slot) then
+            return tonumber(MasterLootDropDown.slot)
+        end
+        if MasterLootDropDown.selectedSlot and tonumber(MasterLootDropDown.selectedSlot) then
+            return tonumber(MasterLootDropDown.selectedSlot)
+        end
+    end
+
+    return nil
+end
+
+local function StartBiddingFromMasterLootMenu(mode)
+    local slotId = ResolveMasterLootMenuSlot()
+    LFBidDebug("StartBiddingFromMasterLootMenu called. mode=" .. tostring(mode) .. ", slot=" .. tostring(slotId))
+    if not slotId then
+        print("LFBid: Could not determine selected loot slot.")
+        return
+    end
+
+    if not GetLootSlotLink then
+        print("LFBid: Loot slot API is not available.")
+        return
+    end
+
+    local itemLink = GetLootSlotLink(slotId)
+    LFBidDebug("Resolved loot slot link: " .. tostring(itemLink))
+    if not itemLink or itemLink == "" then
+        print("LFBid: No item link found for selected loot slot.")
+        return
+    end
+
+    StartBiddingForItemLink(itemLink, mode)
+end
+
+local function AddLFBidEntriesToMasterLootDropdown(level)
+    LFBidDebug("AddLFBidEntriesToMasterLootDropdown level=" .. tostring(level))
+    if level ~= 1 then
+        return
+    end
+
+    if not IsPlayerMasterLooter() then
+        return
+    end
+
+    lfbid_masterLootMenuSlot = nil
+    if LootFrame and LootFrame.selectedSlot and tonumber(LootFrame.selectedSlot) then
+        lfbid_masterLootMenuSlot = tonumber(LootFrame.selectedSlot)
+    elseif MasterLootDropDown and MasterLootDropDown.slot and tonumber(MasterLootDropDown.slot) then
+        lfbid_masterLootMenuSlot = tonumber(MasterLootDropDown.slot)
+    end
+    LFBidDebug("Master loot menu slot captured: " .. tostring(lfbid_masterLootMenuSlot))
+
+    local info = UIDropDownMenu_CreateInfo()
+    info.text = " "
+    info.notCheckable = 1
+    info.disabled = 1
+    UIDropDownMenu_AddButton(info, level)
+
+    info = UIDropDownMenu_CreateInfo()
+    info.isTitle = 1
+    info.text = "LFBid"
+    info.notCheckable = 1
+    UIDropDownMenu_AddButton(info, level)
+
+    info = UIDropDownMenu_CreateInfo()
+    info.text = "Start bidding (points)"
+    info.notCheckable = 1
+    info.disabled = nil
+    info.notClickable = nil
+    info.func = function()
+        StartBiddingFromMasterLootMenu("points")
+    end
+    UIDropDownMenu_AddButton(info, level)
+
+    info = UIDropDownMenu_CreateInfo()
+    info.text = "Start rolling (1-100)"
+    info.notCheckable = 1
+    info.disabled = nil
+    info.notClickable = nil
+    info.func = function()
+        StartBiddingFromMasterLootMenu("roll")
+    end
+    UIDropDownMenu_AddButton(info, level)
+end
+
+local function RegisterLFBidMasterLootDropdownHook()
+    if lfbid_masterLootDropdownHooked then
+        LFBidDebug("Master loot dropdown hook already active.")
+        return
+    end
+
+    if MasterLootDropDown and type(MasterLootDropDown.initialize) == "function" then
+        LFBidDebug("Hooking MasterLootDropDown.initialize")
+        lfbid_masterLootOriginalInitialize = MasterLootDropDown.initialize
+        MasterLootDropDown.initialize = function(level)
+            LFBidDebug("MasterLootDropDown.initialize invoked. level=" .. tostring(level))
+            lfbid_masterLootOriginalInitialize(level)
+            AddLFBidEntriesToMasterLootDropdown(level)
+        end
+        lfbid_masterLootDropdownHooked = true
+        return
+    end
+
+    if type(MasterLootDropDown_Initialize) == "function" then
+        LFBidDebug("Hooking MasterLootDropDown_Initialize")
+        lfbid_masterLootOriginalInitialize = MasterLootDropDown_Initialize
+        MasterLootDropDown_Initialize = function(level)
+            LFBidDebug("MasterLootDropDown_Initialize invoked. level=" .. tostring(level))
+            lfbid_masterLootOriginalInitialize(level)
+            AddLFBidEntriesToMasterLootDropdown(level)
+        end
+        lfbid_masterLootDropdownHooked = true
+        return
+    end
+
+    LFBidDebug("Master loot dropdown initializer was not found.")
+end
+
+local function HookDropDownFrameInitialize(dropDownFrame, sourceTag)
+    if not dropDownFrame or dropDownFrame.lfbidInitializeHooked then
+        return
+    end
+
+    if type(dropDownFrame.initialize) ~= "function" then
+        LFBidDebug("Dropdown frame has no initialize function: " .. tostring(sourceTag or "unknown"))
+        return
+    end
+
+    local originalInitialize = dropDownFrame.initialize
+    dropDownFrame.lfbidInitializeHooked = true
+    dropDownFrame.initialize = function(level)
+        LFBidDebug("Dropdown initialize invoked from " .. tostring(sourceTag or "unknown") .. ", level=" .. tostring(level))
+        originalInitialize(level)
+        if tonumber(level) == 1 and IsGiveLootMenuTitle(level) then
+            LFBidDebug("Detected 'Give Loot To' dropdown, injecting LFBid entries.")
+            AddLFBidEntriesToMasterLootDropdown(level)
+        end
+    end
+    LFBidDebug("Hooked dropdown initialize at runtime: " .. tostring(sourceTag or "unknown"))
+end
+
+local function RegisterLFBidToggleDropDownProbeHook()
+    if lfbid_toggleDropDownHooked then
+        return
+    end
+
+    if type(ToggleDropDownMenu) ~= "function" then
+        LFBidDebug("ToggleDropDownMenu is unavailable.")
+        return
+    end
+
+    lfbid_originalToggleDropDownMenu = ToggleDropDownMenu
+    ToggleDropDownMenu = function(level, value, dropDownFrame, anchorName, xOffset, yOffset)
+        local resolved = ResolveDropDownFrame(dropDownFrame)
+        local frameName = "nil"
+        if resolved and resolved.GetName then
+            frameName = tostring(resolved:GetName() or "unnamed")
+        end
+        LFBidDebug("ToggleDropDownMenu called. level=" .. tostring(level) .. ", frame=" .. frameName)
+
+        if resolved then
+            HookDropDownFrameInitialize(resolved, "ToggleDropDownMenu:" .. frameName)
+        end
+
+        return lfbid_originalToggleDropDownMenu(level, value, dropDownFrame, anchorName, xOffset, yOffset)
+    end
+
+    lfbid_toggleDropDownHooked = true
+    LFBidDebug("Installed ToggleDropDownMenu probe hook.")
+end
 
 local function HandleLFBidSlash(msg)
     if not msg then msg = "" end
@@ -2657,9 +3394,18 @@ local function RegisterLFBidSlashCommand()
 end
 
 RegisterLFBidSlashCommand()
+RegisterLFBidItemRefHook()
+RegisterLFBidLootWindowHook()
+RegisterLFBidMasterLootDropdownHook()
+RegisterLFBidToggleDropDownProbeHook()
 
 local lfbid_initFrame = CreateFrame("Frame")
 lfbid_initFrame:RegisterEvent("PLAYER_LOGIN")
+lfbid_initFrame:RegisterEvent("LOOT_OPENED")
 lfbid_initFrame:SetScript("OnEvent", function()
     RegisterLFBidSlashCommand()
+    RegisterLFBidItemRefHook()
+    RegisterLFBidLootWindowHook()
+    RegisterLFBidMasterLootDropdownHook()
+    RegisterLFBidToggleDropDownProbeHook()
 end)
