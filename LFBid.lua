@@ -720,9 +720,13 @@ local function SendWinnerAnnouncement(outcome)
         return
     end
 
-    local itemText = tostring(outcome.itemLink or "")
+    local rawItemText = tostring(outcome.itemLink or "")
+    local itemText = rawItemText
+    if not string.find(rawItemText, "|Hitem:") then
+        itemText = ItemTextForAnnouncement(rawItemText)
+    end
     if itemText == "" then
-        itemText = ItemTextForAnnouncement(outcome.itemLink)
+        itemText = ItemTextForAnnouncement(rawItemText)
     end
     local message
     if itemText and itemText ~= "" then
