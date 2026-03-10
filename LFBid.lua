@@ -32,6 +32,9 @@ local lfbid_openAltBid = false
 local LFBID_ROLL_VISIBLE_ROWS = 10
 local LFBID_POINTS_VISIBLE_ROWS = 6
 local lfbid_pendingWinnerAnnouncement = nil
+local lfbid_manualWinnerSelectionActive = false
+local lfbid_pendingManualWinnerBid = nil
+local lfbid_manualWinnerCostText = ""
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
@@ -756,14 +759,173 @@ local function EnsureWinnerConfirmPopupRegistered()
                 SendWinnerAnnouncement(lfbid_pendingWinnerAnnouncement)
             end
             lfbid_pendingWinnerAnnouncement = nil
+            lfbid_manualWinnerSelectionActive = false
+            if RefreshLFBidBidList and lfbid_windowOpen then
+                RefreshLFBidBidList()
+            end
         end,
         OnCancel = function()
             lfbid_pendingWinnerAnnouncement = nil
+            lfbid_manualWinnerSelectionActive = true
+            if IsPlayerMasterLooter() then
+                print("LFBid: Click a bid in the ML list to pick a winner manually.")
+            end
+            if RefreshLFBidBidList and lfbid_windowOpen then
+                RefreshLFBidBidList()
+            end
         end,
         timeout = 0,
         whileDead = true,
         hideOnEscape = true,
     }
+end
+
+local function EnsureManualWinnerCostPopupRegistered()
+    StaticPopupDialogs = StaticPopupDialogs or {}
+    if StaticPopupDialogs["LFBID_MANUAL_WINNER_COST"] then
+        return
+    end
+
+    local function ReadManualWinnerCostText(popupFrame)
+        local candidateFrames = {}
+        if popupFrame then
+            table.insert(candidateFrames, popupFrame)
+        end
+
+        if this then
+            table.insert(candidateFrames, this)
+            if this.GetParent then
+                local parent = this:GetParent()
+                if parent then
+                    table.insert(candidateFrames, parent)
+                end
+            end
+        end
+
+        local index
+        for index = 1, 4 do
+            local frame = getglobal("StaticPopup" .. tostring(index))
+            if frame and frame.which == "LFBID_MANUAL_WINNER_COST" then
+                table.insert(candidateFrames, frame)
+            end
+            local editBox = getglobal("StaticPopup" .. tostring(index) .. "EditBox")
+            if editBox and editBox.GetParent and editBox:GetParent() and editBox:GetParent().which == "LFBID_MANUAL_WINNER_COST" then
+                local value = tostring(editBox:GetText() or "")
+                if value ~= "" then
+                    return value
+                end
+            end
+        end
+
+        local _, frame
+        for _, frame in ipairs(candidateFrames) do
+            if frame and frame.editBox and frame.editBox.GetText then
+                return tostring(frame.editBox:GetText() or "")
+            end
+        end
+
+        return tostring(lfbid_manualWinnerCostText or "")
+    end
+
+    StaticPopupDialogs["LFBID_MANUAL_WINNER_COST"] = {
+        text = "%s",
+        button1 = "Announce",
+        button2 = "Cancel",
+        hasEditBox = 1,
+        maxLetters = 6,
+        OnShow = function(popupFrame)
+            local frame = popupFrame or this
+            if frame and frame.editBox then
+                frame.editBox:SetText("")
+                frame.editBox:SetFocus()
+                frame.editBox:HighlightText()
+                lfbid_manualWinnerCostText = ""
+                frame.editBox:SetScript("OnTextChanged", function()
+                    lfbid_manualWinnerCostText = tostring(this:GetText() or "")
+                end)
+                frame.editBox:SetScript("OnEscapePressed", function()
+                    if this and this:GetParent() then
+                        this:GetParent():Hide()
+                    end
+                end)
+            end
+        end,
+        EditBoxOnEnterPressed = function()
+            lfbid_manualWinnerCostText = tostring(this:GetText() or "")
+            if this and this:GetParent() and this:GetParent().button1 then
+                this:GetParent().button1:Click()
+            end
+        end,
+        OnAccept = function(popupFrame)
+            if not lfbid_pendingManualWinnerBid then
+                return
+            end
+
+            local textValue = ReadManualWinnerCostText(popupFrame)
+            textValue = string.gsub(textValue, "^%s+", "")
+            textValue = string.gsub(textValue, "%s+$", "")
+
+            local cost = tonumber(textValue)
+            if not cost then
+                print("LFBid: Please enter a numeric DKP amount.")
+                return
+            end
+
+            cost = math.floor(cost + 0.5)
+            if cost < 1 then
+                print("LFBid: DKP amount must be at least 1.")
+                return
+            end
+
+            local bid = lfbid_pendingManualWinnerBid
+            local outcome = {
+                winnerName = tostring(bid.name or ""),
+                winnerSpec = NormalizeSpec(bid.spec),
+                winnerBid = tonumber(bid.points) or 0,
+                cost = cost,
+                itemLink = tostring(lfbid_activeItem or ""),
+            }
+
+            SendWinnerAnnouncement(outcome)
+            lfbid_manualWinnerSelectionActive = false
+            lfbid_pendingManualWinnerBid = nil
+            lfbid_manualWinnerCostText = ""
+            if RefreshLFBidBidList and lfbid_windowOpen then
+                RefreshLFBidBidList()
+            end
+        end,
+        OnCancel = function()
+            lfbid_pendingManualWinnerBid = nil
+            lfbid_manualWinnerCostText = ""
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+end
+
+local function StartManualWinnerSelectionForBid(bid)
+    if not IsPlayerMasterLooter() then
+        return
+    end
+    if not lfbid_manualWinnerSelectionActive then
+        return
+    end
+    if lfbid_biddingOpen then
+        return
+    end
+    if not bid or not bid.name then
+        return
+    end
+
+    EnsureManualWinnerCostPopupRegistered()
+    lfbid_pendingManualWinnerBid = bid
+    local text = tostring(bid.name) .. " selected. Enter DKP cost:"
+    if StaticPopup_Show then
+        StaticPopup_Show("LFBID_MANUAL_WINNER_COST", text)
+    else
+        print("LFBid: " .. text)
+    end
 end
 
 local function CloseBidding()
@@ -911,6 +1073,8 @@ local function StartPointsBiddingFromMasterWindow()
 
     lfbid_openItemLink = lfbid_activeItem
     lfbid_biddingOpen = true
+    lfbid_manualWinnerSelectionActive = false
+    lfbid_pendingManualWinnerBid = nil
 
     if mlOpeningBidPoints ~= nil then
         local myName = tostring(UnitName("player") or "")
@@ -1147,6 +1311,37 @@ RefreshLFBidBidList = function()
         end)
     end
 
+    local function EnsureSpecRowButtons(cell)
+        if not cell or cell.rowButtons then
+            return
+        end
+
+        cell.rowButtons = {}
+        local rowIndex
+        for rowIndex = 1, LFBID_POINTS_VISIBLE_ROWS do
+            local rowButton = CreateFrame("Button", nil, cell)
+            rowButton:SetWidth(158)
+            rowButton:SetHeight(12)
+            if rowIndex == 1 then
+                rowButton:SetPoint("TOPLEFT", cell.label, "BOTTOMLEFT", 0, -2)
+            else
+                rowButton:SetPoint("TOPLEFT", cell.rowButtons[rowIndex - 1], "BOTTOMLEFT", 0, 0)
+            end
+
+            rowButton.text = rowButton:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            rowButton.text:SetPoint("LEFT", rowButton, "LEFT", 0, 0)
+            rowButton.text:SetJustifyH("LEFT")
+
+            rowButton:SetScript("OnClick", function()
+                if this and this.bidData then
+                    StartManualWinnerSelectionForBid(this.bidData)
+                end
+            end)
+
+            table.insert(cell.rowButtons, rowButton)
+        end
+    end
+
     if lfbid_bidMode == "roll" then
         local specs = {"ROLLS"}
         local grouped = {
@@ -1332,6 +1527,7 @@ RefreshLFBidBidList = function()
 
     for _, spec in ipairs(specs) do
         local lines = {}
+        local visibleBids = {}
         local bidList = grouped[spec] or {}
         local startIndex = (lfbid_specScrollOffsets[spec] or 0) + 1
         local endIndex = (lfbid_specScrollOffsets[spec] or 0) + LFBID_POINTS_VISIBLE_ROWS
@@ -1350,6 +1546,7 @@ RefreshLFBidBidList = function()
                     line = pointsText .. " - ALT - " .. nameText
                 end
                 table.insert(lines, line)
+                table.insert(visibleBids, bid)
             end
         end
         if table.getn(lines) == 0 then
@@ -1357,6 +1554,7 @@ RefreshLFBidBidList = function()
         end
 
         specLines[spec] = lines
+        specLines[spec .. "_BIDS"] = visibleBids
         specCellHeight[spec] = fixedCellHeight
     end
 
@@ -1387,6 +1585,7 @@ RefreshLFBidBidList = function()
         end
 
         AttachSpecScrollBar(cell)
+        EnsureSpecRowButtons(cell)
 
         cell:SetWidth(colWidth)
         if cell.text then
@@ -1416,7 +1615,32 @@ RefreshLFBidBidList = function()
         end
 
         cell.label:SetText(spec)
-        cell.text:SetText(table.concat(specLines[spec], "\n"))
+        if cell.text then
+            cell.text:SetText("")
+        end
+
+        local visibleBidRows = specLines[spec .. "_BIDS"] or {}
+        if cell.rowButtons then
+            local rowIndex
+            for rowIndex = 1, LFBID_POINTS_VISIBLE_ROWS do
+                local rowButton = cell.rowButtons[rowIndex]
+                if rowButton then
+                    rowButton:SetWidth(colWidth - 34)
+                    local lineText = specLines[spec][rowIndex] or ""
+                    local bidData = visibleBidRows[rowIndex]
+                    rowButton.bidData = bidData
+                    rowButton.text:SetText(lineText)
+
+                    if bidData and IsPlayerMasterLooter() and lfbid_manualWinnerSelectionActive and not lfbid_biddingOpen then
+                        rowButton:EnableMouse(true)
+                    else
+                        rowButton:EnableMouse(false)
+                    end
+
+                    rowButton:Show()
+                end
+            end
+        end
         cell:Show()
     end
 
@@ -1446,6 +1670,14 @@ RefreshLFBidBidList = function()
         if cell then
             if cell.scrollBar then
                 cell.scrollBar:Hide()
+            end
+            if cell.rowButtons then
+                local rowIndex
+                for rowIndex = 1, table.getn(cell.rowButtons) do
+                    if cell.rowButtons[rowIndex] then
+                        cell.rowButtons[rowIndex]:Hide()
+                    end
+                end
             end
             cell:Hide()
         end
@@ -2669,6 +2901,8 @@ OpenLFBidWindow = function(itemLink, bidMode)
     lfbid_bidMode = bidMode or "points"
     lfbid_bids = {}
     lfbid_rollSeen = {}
+    lfbid_manualWinnerSelectionActive = false
+    lfbid_pendingManualWinnerBid = nil
     lfbid_bidListScrollOffset = 0
     lfbid_bidListMaxOffset = 0
     lfbid_specScrollOffsets = {}
