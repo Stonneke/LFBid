@@ -636,7 +636,7 @@ local function StartLFBidMessageTimer(messages, intervalOrIntervals, onDone)
 
         local msg = lfbid_timerFrame.messages[lfbid_timerFrame.index]
         if msg then
-            SendSafeChatMessage(msg, "RAID")
+            SendSafeChatMessage(msg, "RAID_WARNING")
             lfbid_timerFrame.index = lfbid_timerFrame.index + 1
             return
         end
@@ -1089,7 +1089,7 @@ local function StartPointsBiddingFromMasterWindow()
     end
 
     SendBiddingStartMessage(lfbid_activeItem)
-    SendSafeChatMessage("Start bidding on item: " .. lfbid_activeItem, "RAID")
+    SendSafeChatMessage("Start bidding on item: " .. lfbid_activeItem, "RAID_WARNING")
 
     if RefreshMasterLootButtons then
         RefreshMasterLootButtons()
@@ -3028,7 +3028,13 @@ if not lfbid_whisperFrame then
                 RefreshLFBidBidList()
             end
         else
-            print("LFBid: Failed to parse " .. sourceType .. " bid from " .. (sender or "unknown") .. ": " .. (msg or "no message"))
+            local myName = NormalizeBidderName(UnitName("player"))
+            local senderName = NormalizeBidderName(sender)
+            local amML = IsPlayerMasterLooter()
+            local isSelfSender = myName ~= "" and senderName ~= "" and string.lower(myName) == string.lower(senderName)
+            if amML or isSelfSender then
+                print("LFBid: Failed to parse " .. sourceType .. " bid from " .. (sender or "unknown") .. ": " .. (msg or "no message"))
+            end
         end
     end)
 end
@@ -3060,7 +3066,9 @@ lfbid_openSyncFrame:SetScript("OnEvent", function(_, eventName, p1, p2, p3, p4)
             return
         end
 
-        print("LFBid: Received LFDKP message but could not parse: " .. tostring(msg))
+        if IsPlayerMasterLooter() then
+            print("LFBid: Received LFDKP message but could not parse: " .. tostring(msg))
+        end
         return
     end
 
@@ -3085,7 +3093,9 @@ lfbid_openSyncFrame:SetScript("OnEvent", function(_, eventName, p1, p2, p3, p4)
         if lfbid_openFrame and lfbid_openWindowOpen then
             lfbid_openFrame:Hide()
             lfbid_openWindowOpen = false
-            print("LFBid: Bidding is now closed.")
+            if IsPlayerMasterLooter() then
+                print("LFBid: Bidding is now closed.")
+            end
         end
         return
     end
@@ -3122,7 +3132,7 @@ local function StartBiddingForItemLink(itemLink, mode)
         lfbid_biddingOpen = true
         lfbid_bidMode = "roll"
         lfbid_rollSeen = {}
-        SendSafeChatMessage("Start rolling for item: " .. normalizedItemLink, "RAID")
+        SendSafeChatMessage("Start rolling for item: " .. normalizedItemLink, "RAID_WARNING")
         OpenLFBidWindow(normalizedItemLink, "roll")
         return
     end
@@ -3594,7 +3604,7 @@ local function HandleLFBidSlash(msg)
         lfbid_biddingOpen = true
         lfbid_bidMode = "roll"
         lfbid_rollSeen = {}
-        SendSafeChatMessage("Start rolling for item: " .. rest, "RAID")
+        SendSafeChatMessage("Start rolling for item: " .. rest, "RAID_WARNING")
         OpenLFBidWindow(rest, "roll")
     elseif cmd == "open" then
         if lfbid_openWindowOpen then
