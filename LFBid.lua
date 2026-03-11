@@ -83,7 +83,7 @@ local function ParseBidMessage(msg, fallbackName)
     for token in tokenIter(text, "%S+") do
         table.insert(tokens, token)
     end
-    if table.getn(tokens) < 2 then
+    if table.getn(tokens) < 1 then
         return nil, nil, nil, false
     end
 
@@ -94,7 +94,7 @@ local function ParseBidMessage(msg, fallbackName)
         table.remove(tokens)
     end
 
-    if table.getn(tokens) < 2 then
+    if table.getn(tokens) < 1 then
         return nil, nil, nil, false
     end
 
@@ -114,6 +114,15 @@ local function ParseBidMessage(msg, fallbackName)
     elseif token2Number and not token1Number then
         points = token2Number
         spec = token1
+    end
+
+    -- Allow transmog bids without points (e.g. "T-MOG" or "TMOG").
+    if not points and table.getn(tokens) == 1 then
+        local only = string.lower(tostring(tokens[1] or ""))
+        if only == "tmog" or only == "t-mog" then
+            points = 0
+            spec = tokens[1]
+        end
     end
 
     -- Backward compatibility for old format with explicit player name in payload.
@@ -699,9 +708,44 @@ local function ResolvePointsAuctionOutcome()
     end
 
     local cost = 1
+    local winnerBid = tonumber(winner.points) or 0
+
+    local tiedTop = {}
+    local _, bidEntry
+    for _, bidEntry in ipairs(selectedBids) do
+        local bidPoints = tonumber(bidEntry and bidEntry.points) or 0
+        if bidPoints == winnerBid then
+            table.insert(tiedTop, tostring(bidEntry.name or ""))
+        else
+            break
+        end
+    end
+
+    if table.getn(tiedTop) >= 2 then
+        table.sort(tiedTop, function(a, b)
+            return string.lower(tostring(a or "")) < string.lower(tostring(b or ""))
+        end)
+
+        return {
+            isTie = true,
+            tieNames = tiedTop,
+            winnerSpec = selectedSpec,
+            winnerBid = winnerBid,
+            cost = winnerBid,
+            itemLink = tostring(lfbid_activeItem or ""),
+        }
+    end
+
     if table.getn(selectedBids) >= 2 then
         local secondBid = tonumber(selectedBids[2].points) or 0
-        cost = secondBid + 1
+
+        -- If top bids are tied, winner pays the tied bid amount.
+        -- Only unique top bids use second-highest + 1.
+        if winnerBid == secondBid then
+            cost = winnerBid
+        else
+            cost = secondBid + 1
+        end
     end
     if cost < 1 then
         cost = 1
@@ -710,7 +754,7 @@ local function ResolvePointsAuctionOutcome()
     return {
         winnerName = winner.name,
         winnerSpec = selectedSpec,
-        winnerBid = tonumber(winner.points) or 0,
+        winnerBid = winnerBid,
         cost = cost,
         itemLink = tostring(lfbid_activeItem or ""),
     }
@@ -730,7 +774,14 @@ local function SendWinnerAnnouncement(outcome)
         itemText = ItemTextForAnnouncement(rawItemText)
     end
     local message
-    if itemText and itemText ~= "" then
+    if outcome.isTie and outcome.tieNames and table.getn(outcome.tieNames) >= 2 then
+        local names = table.concat(outcome.tieNames, ", ")
+        if itemText and itemText ~= "" then
+            message = itemText .. " tied between " .. names .. ". Roll for it for " .. tostring(outcome.cost) .. " DKP"
+        else
+            message = "Tie between " .. names .. ". Roll for it for " .. tostring(outcome.cost) .. " DKP"
+        end
+    elseif itemText and itemText ~= "" then
         message = itemText .. " won by " .. tostring(outcome.winnerName) .. " for " .. tostring(outcome.cost) .. " DKP"
     else
         message = tostring(outcome.winnerName) .. " won for " .. tostring(outcome.cost) .. " DKP"
@@ -1007,14 +1058,23 @@ local function CloseBidding()
                 if IsPlayerMasterLooter() then
                     EnsureWinnerConfirmPopupRegistered()
                     lfbid_pendingWinnerAnnouncement = pointsOutcome
-                    local confirmText = tostring(pointsOutcome.winnerName) .. " won for " .. tostring(pointsOutcome.cost) .. " DKP, announce?"
+                    local confirmText
+                    if pointsOutcome.isTie and pointsOutcome.tieNames and table.getn(pointsOutcome.tieNames) >= 2 then
+                        confirmText = "Tie: " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Announce roll-off for " .. tostring(pointsOutcome.cost) .. " DKP?"
+                    else
+                        confirmText = tostring(pointsOutcome.winnerName) .. " won for " .. tostring(pointsOutcome.cost) .. " DKP, announce?"
+                    end
                     if StaticPopup_Show then
                         StaticPopup_Show("LFBID_CONFIRM_WINNER_ANNOUNCE", confirmText)
                     else
                         print("LFBid: " .. confirmText)
                     end
                 else
-                    print("LFBid: Winner is " .. tostring(pointsOutcome.winnerName) .. " for " .. tostring(pointsOutcome.cost) .. " DKP.")
+                    if pointsOutcome.isTie and pointsOutcome.tieNames and table.getn(pointsOutcome.tieNames) >= 2 then
+                        print("LFBid: Tie between " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Roll-off for " .. tostring(pointsOutcome.cost) .. " DKP.")
+                    else
+                        print("LFBid: Winner is " .. tostring(pointsOutcome.winnerName) .. " for " .. tostring(pointsOutcome.cost) .. " DKP.")
+                    end
                 end
             else
                 print("LFBid: Bidding ended with no valid MS/OS/T-MOG bids.")
@@ -1095,6 +1155,8 @@ local function StartPointsBiddingFromMasterWindow()
 
     SendBiddingStartMessage(lfbid_activeItem)
     SendSafeChatMessage("Start bidding on item: " .. lfbid_activeItem, "RAID_WARNING")
+    local whisperTarget = GetCurrentLootMasterName() or UnitName("player") or "ML"
+    SendSafeChatMessage("Bid via /w " .. tostring(whisperTarget) .. " <spec> <points> (example: MS 25)", "RAID_WARNING")
 
     if RefreshMasterLootButtons then
         RefreshMasterLootButtons()
@@ -2032,31 +2094,6 @@ local function OpenLFBidOpenWindow()
             lfbid_openWindowOpen = false
         end)
 
-        lfbid_openFrame.mlStartBidBtn = CreateFrame("Button", nil, lfbid_openFrame, "UIPanelButtonTemplate")
-        lfbid_openFrame.mlStartBidBtn:SetWidth(92)
-        lfbid_openFrame.mlStartBidBtn:SetHeight(20)
-        lfbid_openFrame.mlStartBidBtn:SetPoint("BOTTOMLEFT", lfbid_openFrame, "BOTTOMLEFT", 10, 40)
-        lfbid_openFrame.mlStartBidBtn:SetText("Start Bid")
-        lfbid_openFrame.mlStartBidBtn:SetScript("OnClick", function()
-            local itemLink = lfbid_openItemLink
-            if lfbid_openFrame.itemLinkButton and lfbid_openFrame.itemLinkButton.itemLink and lfbid_openFrame.itemLinkButton.itemLink ~= "" then
-                itemLink = lfbid_openFrame.itemLinkButton.itemLink
-            end
-            StartBiddingForItemLink(itemLink, "points")
-        end)
-
-        lfbid_openFrame.mlStartRollBtn = CreateFrame("Button", nil, lfbid_openFrame, "UIPanelButtonTemplate")
-        lfbid_openFrame.mlStartRollBtn:SetWidth(92)
-        lfbid_openFrame.mlStartRollBtn:SetHeight(20)
-        lfbid_openFrame.mlStartRollBtn:SetPoint("LEFT", lfbid_openFrame.mlStartBidBtn, "RIGHT", 8, 0)
-        lfbid_openFrame.mlStartRollBtn:SetText("Start Roll")
-        lfbid_openFrame.mlStartRollBtn:SetScript("OnClick", function()
-            local itemLink = lfbid_openItemLink
-            if lfbid_openFrame.itemLinkButton and lfbid_openFrame.itemLinkButton.itemLink and lfbid_openFrame.itemLinkButton.itemLink ~= "" then
-                itemLink = lfbid_openFrame.itemLinkButton.itemLink
-            end
-            StartBiddingForItemLink(itemLink, "roll")
-        end)
     end
 
     UIDropDownMenu_SetSelectedValue(lfbid_openFrame.dropDown, lfbid_openType)
@@ -2088,24 +2125,12 @@ local function OpenLFBidOpenWindow()
         lfbid_openFrame.alphaSlider:SetValue(lfbid_backdropAlpha)
     end
 
-    if lfbid_openFrame.mlStartBidBtn and lfbid_openFrame.mlStartRollBtn then
-        local hasItemLink = lfbid_openItemLink and lfbid_openItemLink ~= ""
-        local canStartForItem = hasItemLink and IsPlayerMasterLooter() and not lfbid_windowOpen
-
-        if hasItemLink then
-            lfbid_openFrame.mlStartBidBtn:Show()
-            lfbid_openFrame.mlStartRollBtn:Show()
-            if canStartForItem then
-                lfbid_openFrame.mlStartBidBtn:Enable()
-                lfbid_openFrame.mlStartRollBtn:Enable()
-            else
-                lfbid_openFrame.mlStartBidBtn:Disable()
-                lfbid_openFrame.mlStartRollBtn:Disable()
-            end
-        else
-            lfbid_openFrame.mlStartBidBtn:Hide()
-            lfbid_openFrame.mlStartRollBtn:Hide()
-        end
+    -- Cleanup for older builds: these controls should not exist on the bidder open window.
+    if lfbid_openFrame.mlStartBidBtn then
+        lfbid_openFrame.mlStartBidBtn:Hide()
+    end
+    if lfbid_openFrame.mlStartRollBtn then
+        lfbid_openFrame.mlStartRollBtn:Hide()
     end
 
     ApplyLFBidBackdropAlpha()
@@ -2160,6 +2185,28 @@ local function BuildSortedDKPSheetRows()
     end)
 
     return rows
+end
+
+local function ReloadDKPFromFileDefaults()
+    local defaults = LFTentDKPDefaults
+    local reloaded = {}
+
+    if type(defaults) == "table" then
+        local name, value
+        for name, value in pairs(defaults) do
+            if type(value) == "table" then
+                reloaded[name] = {
+                    t1 = tonumber(value.t1 or value.tier1 or value[1] or value["Tier 1"] or value.Tier1 or value.points1 or value.dkp1) or 0,
+                    t2 = tonumber(value.t2 or value.tier2 or value[2] or value["Tier 2"] or value.Tier2 or value.points2 or value.dkp2) or 0,
+                }
+            else
+                reloaded[name] = tonumber(value) or 0
+            end
+        end
+    end
+
+    -- Replace current runtime/saved DKP table with file defaults.
+    LFTentDKP = reloaded
 end
 
 local function NormalizeDKPPlayerName(name)
@@ -2472,6 +2519,18 @@ local function OpenLFBidDKPSheetWindow()
         lfbid_dkpSheetFrame.title = lfbid_dkpSheetFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         lfbid_dkpSheetFrame.title:SetPoint("TOPLEFT", lfbid_dkpSheetFrame, "TOPLEFT", 10, -14)
         lfbid_dkpSheetFrame.title:SetText("LFBid DKP Sheet")
+
+        lfbid_dkpSheetFrame.reloadFileBtn = CreateFrame("Button", nil, lfbid_dkpSheetFrame, "UIPanelButtonTemplate")
+        lfbid_dkpSheetFrame.reloadFileBtn:SetWidth(118)
+        lfbid_dkpSheetFrame.reloadFileBtn:SetHeight(20)
+        lfbid_dkpSheetFrame.reloadFileBtn:SetPoint("TOPRIGHT", lfbid_dkpSheetFrame, "TOPRIGHT", -34, -10)
+        lfbid_dkpSheetFrame.reloadFileBtn:SetText("Reload From File")
+        lfbid_dkpSheetFrame.reloadFileBtn:SetScript("OnClick", function()
+            ReloadDKPFromFileDefaults()
+            lfbid_dkpSheetScrollOffset = 0
+            RefreshLFBidDKPSheetWindow()
+            print("LFBid: DKP reloaded from DKPData file defaults.")
+        end)
 
         lfbid_dkpSheetFrame.closeBtn = CreateFrame("Button", nil, lfbid_dkpSheetFrame, "UIPanelButtonTemplate")
         lfbid_dkpSheetFrame.closeBtn:SetWidth(24)
@@ -3031,6 +3090,17 @@ if not lfbid_whisperFrame then
             return
         end
 
+        -- Only the active Master Looter should parse whisper bids.
+        if evt == "CHAT_MSG_WHISPER" and not IsPlayerMasterLooter() then
+            return
+        end
+
+        -- Addon bid payloads are mirrored to the group; only ML should parse them here.
+        -- Start/close sync is handled by lfbid_openSyncFrame separately.
+        if evt == "CHAT_MSG_ADDON" and not IsPlayerMasterLooter() then
+            return
+        end
+
         local msg
         local sender
         local sourceType = "whisper"
@@ -3050,6 +3120,15 @@ if not lfbid_whisperFrame then
 
         if not msg or msg == "" or not sender then
             return
+        end
+
+        if sourceType == "addon" then
+            local myName = NormalizeBidderName(UnitName("player"))
+            local senderName = NormalizeBidderName(sender)
+            if myName ~= "" and senderName ~= "" and string.lower(myName) == string.lower(senderName) then
+                -- Ignore our own mirrored addon payloads.
+                return
+            end
         end
 
         if sourceType == "addon" and ExtractStartPayload(msg) ~= nil then
@@ -3080,11 +3159,8 @@ if not lfbid_whisperFrame then
                 RefreshLFBidBidList()
             end
         else
-            local myName = NormalizeBidderName(UnitName("player"))
-            local senderName = NormalizeBidderName(sender)
             local amML = IsPlayerMasterLooter()
-            local isSelfSender = myName ~= "" and senderName ~= "" and string.lower(myName) == string.lower(senderName)
-            if amML or isSelfSender then
+            if amML then
                 print("LFBid: Failed to parse " .. sourceType .. " bid from " .. (sender or "unknown") .. ": " .. (msg or "no message"))
             end
         end
