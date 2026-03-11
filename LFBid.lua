@@ -310,7 +310,7 @@ local function IsPlayerMasterLooter()
     return string.lower(tostring(myName)) == string.lower(tostring(lootMasterName))
 end
 
-local function IsPlayerFounderOrBanker()
+local function IsPlayerOfficerRank()
     if not GetGuildInfo then
         return false
     end
@@ -321,7 +321,7 @@ local function IsPlayerFounderOrBanker()
     end
 
     local normalizedRank = string.lower(tostring(rankName))
-    return normalizedRank == "founder" or normalizedRank == "banker"
+    return normalizedRank == "chief officer" or normalizedRank == "officer"
 end
 
 local function IsPlayerGuildRankAlt()
@@ -4201,8 +4201,8 @@ local function HandleLFBidSlash(msg)
         end
         OpenLFBidOpenWindow()
     elseif cmd == "options" then
-        if not IsPlayerMasterLooter() and not IsPlayerFounderOrBanker() then
-            print("LFBid: /lfbid options is only available to the Master Looter, Founder, or Banker.")
+        if not IsPlayerMasterLooter() and not IsPlayerOfficerRank() then
+            print("LFBid: /lfbid options is only available to the Master Looter, Chief Officer, or Officer.")
             return
         end
         if lfbid_optionsWindowOpen then
