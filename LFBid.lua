@@ -39,6 +39,7 @@ local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
 local OpenLFBidWindow
+local StartBiddingForItemLink
 
 local function ApplyLFBidBackdropAlpha()
     if LFbidFrame then
@@ -2030,6 +2031,32 @@ local function OpenLFBidOpenWindow()
             lfbid_openFrame:Hide()
             lfbid_openWindowOpen = false
         end)
+
+        lfbid_openFrame.mlStartBidBtn = CreateFrame("Button", nil, lfbid_openFrame, "UIPanelButtonTemplate")
+        lfbid_openFrame.mlStartBidBtn:SetWidth(92)
+        lfbid_openFrame.mlStartBidBtn:SetHeight(20)
+        lfbid_openFrame.mlStartBidBtn:SetPoint("BOTTOMLEFT", lfbid_openFrame, "BOTTOMLEFT", 10, 40)
+        lfbid_openFrame.mlStartBidBtn:SetText("Start Bid")
+        lfbid_openFrame.mlStartBidBtn:SetScript("OnClick", function()
+            local itemLink = lfbid_openItemLink
+            if lfbid_openFrame.itemLinkButton and lfbid_openFrame.itemLinkButton.itemLink and lfbid_openFrame.itemLinkButton.itemLink ~= "" then
+                itemLink = lfbid_openFrame.itemLinkButton.itemLink
+            end
+            StartBiddingForItemLink(itemLink, "points")
+        end)
+
+        lfbid_openFrame.mlStartRollBtn = CreateFrame("Button", nil, lfbid_openFrame, "UIPanelButtonTemplate")
+        lfbid_openFrame.mlStartRollBtn:SetWidth(92)
+        lfbid_openFrame.mlStartRollBtn:SetHeight(20)
+        lfbid_openFrame.mlStartRollBtn:SetPoint("LEFT", lfbid_openFrame.mlStartBidBtn, "RIGHT", 8, 0)
+        lfbid_openFrame.mlStartRollBtn:SetText("Start Roll")
+        lfbid_openFrame.mlStartRollBtn:SetScript("OnClick", function()
+            local itemLink = lfbid_openItemLink
+            if lfbid_openFrame.itemLinkButton and lfbid_openFrame.itemLinkButton.itemLink and lfbid_openFrame.itemLinkButton.itemLink ~= "" then
+                itemLink = lfbid_openFrame.itemLinkButton.itemLink
+            end
+            StartBiddingForItemLink(itemLink, "roll")
+        end)
     end
 
     UIDropDownMenu_SetSelectedValue(lfbid_openFrame.dropDown, lfbid_openType)
@@ -2060,6 +2087,27 @@ local function OpenLFBidOpenWindow()
     if lfbid_openFrame.alphaSlider then
         lfbid_openFrame.alphaSlider:SetValue(lfbid_backdropAlpha)
     end
+
+    if lfbid_openFrame.mlStartBidBtn and lfbid_openFrame.mlStartRollBtn then
+        local hasItemLink = lfbid_openItemLink and lfbid_openItemLink ~= ""
+        local canStartForItem = hasItemLink and IsPlayerMasterLooter() and not lfbid_windowOpen
+
+        if hasItemLink then
+            lfbid_openFrame.mlStartBidBtn:Show()
+            lfbid_openFrame.mlStartRollBtn:Show()
+            if canStartForItem then
+                lfbid_openFrame.mlStartBidBtn:Enable()
+                lfbid_openFrame.mlStartRollBtn:Enable()
+            else
+                lfbid_openFrame.mlStartBidBtn:Disable()
+                lfbid_openFrame.mlStartRollBtn:Disable()
+            end
+        else
+            lfbid_openFrame.mlStartBidBtn:Hide()
+            lfbid_openFrame.mlStartRollBtn:Hide()
+        end
+    end
+
     ApplyLFBidBackdropAlpha()
     lfbid_openWindowOpen = true
     lfbid_openFrame:Show()
@@ -3113,7 +3161,7 @@ local lfbid_itemContextMenuFrame
 local lfbid_itemContextLink = nil
 local lfbid_originalSetItemRef = nil
 
-local function StartBiddingForItemLink(itemLink, mode)
+StartBiddingForItemLink = function(itemLink, mode)
     local normalizedItemLink = tostring(itemLink or "")
     if normalizedItemLink == "" then
         print("LFBid: Could not determine item link.")
@@ -3146,6 +3194,11 @@ local function StartBiddingForItemLink(itemLink, mode)
     lfbid_biddingOpen = false
     lfbid_bidMode = "points"
     OpenLFBidWindow(normalizedItemLink, "points")
+end
+
+-- Cross-addon bridge for integrations (XLootMaster, etc.).
+LFBid_StartBiddingForItemLink = function(itemLink, mode)
+    StartBiddingForItemLink(itemLink, mode)
 end
 
 local function ExtractItemLinkFromItemRef(link, text)
@@ -3251,6 +3304,12 @@ local lfbid_masterLootMenuSlot = nil
 local lfbid_debugEnabled = false
 local lfbid_toggleDropDownHooked = false
 local lfbid_originalToggleDropDownMenu = nil
+local lfbid_rollForButton = nil
+local lfbid_rollForMenuFrame = nil
+local lfbid_rollForMenuEntries = {}
+local lfbid_rollForPopupBidBtn = nil
+local lfbid_rollForPopupRollBtn = nil
+local lfbid_rollForPopupUpdateElapsed = 0
 
 local function LFBidDebug(message)
     if not lfbid_debugEnabled then
@@ -3332,6 +3391,438 @@ local function HookLootButtonsForLFBid()
     end
 end
 
+local function ResolveItemLinkFromRollForButton(buttonFrame)
+    if not buttonFrame then
+        return nil
+    end
+
+    local slotCandidates = {}
+
+    local function PushSlotCandidate(value)
+        local n = tonumber(value)
+        if n and n > 0 then
+            table.insert(slotCandidates, n)
+        end
+    end
+
+    if buttonFrame.slot then
+        PushSlotCandidate(buttonFrame.slot)
+    end
+    if buttonFrame.GetID then
+        PushSlotCandidate(buttonFrame:GetID())
+    end
+
+    local parent = buttonFrame.GetParent and buttonFrame:GetParent() or nil
+    if parent then
+        if parent.slot then
+            PushSlotCandidate(parent.slot)
+        end
+        if parent.GetID then
+            PushSlotCandidate(parent:GetID())
+        end
+    end
+
+    if GetLootSlotLink then
+        local _, slotId
+        for _, slotId in ipairs(slotCandidates) do
+            local itemLink = GetLootSlotLink(slotId)
+            if itemLink and itemLink ~= "" then
+                lfbid_masterLootMenuSlot = slotId
+                return itemLink
+            end
+        end
+    end
+
+    return nil
+end
+
+local function HookRollForFrameClickTarget(frame)
+    if not frame or frame.lfbidRollForHooked then
+        return
+    end
+
+    if type(frame.IsObjectType) ~= "function" then
+        return
+    end
+
+    if not frame:IsObjectType("Button") and not frame:IsObjectType("CheckButton") then
+        return
+    end
+
+    if type(frame.GetScript) ~= "function" then
+        return
+    end
+
+    local originalOnClick = frame:GetScript("OnClick")
+    if type(originalOnClick) ~= "function" then
+        return
+    end
+
+    if type(frame.RegisterForClicks) == "function" then
+        frame:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    end
+
+    frame.lfbidRollForHooked = true
+    frame.lfbidOriginalOnClick = originalOnClick
+    frame:SetScript("OnClick", function(self, mouseButton)
+        local clickedButton = mouseButton or (_G and _G.arg1)
+        local clickFrame = self or (_G and _G.this)
+
+        if clickedButton == "RightButton" then
+            local itemLink = ResolveItemLinkFromRollForButton(clickFrame)
+            if itemLink and itemLink ~= "" then
+                ShowLFBidItemContextMenu(itemLink)
+                return
+            end
+        end
+
+        if clickFrame and clickFrame.lfbidOriginalOnClick then
+            return clickFrame.lfbidOriginalOnClick(self, mouseButton)
+        end
+    end)
+end
+
+local function UpdateRollForRowActionButtonState(frame)
+    if not frame or not frame.lfbidBidButton or not frame.lfbidRollButton then
+        return
+    end
+
+    local itemLink = frame.lfbidCurrentItemLink
+    local hasItem = itemLink and itemLink ~= ""
+    local canStart = hasItem and IsPlayerMasterLooter() and not lfbid_windowOpen
+
+    if hasItem then
+        frame.lfbidBidButton:Show()
+        frame.lfbidRollButton:Show()
+    else
+        frame.lfbidBidButton:Hide()
+        frame.lfbidRollButton:Hide()
+        return
+    end
+
+    if canStart then
+        frame.lfbidBidButton:Enable()
+        frame.lfbidRollButton:Enable()
+    else
+        frame.lfbidBidButton:Disable()
+        frame.lfbidRollButton:Disable()
+    end
+end
+
+local function EnsureRollForRowActionButtons(frame)
+    if not frame or type(frame.SetItem) ~= "function" then
+        return
+    end
+
+    if not frame.lfbidOriginalSetItem then
+        frame.lfbidOriginalSetItem = frame.SetItem
+        frame.SetItem = function(self, itemData)
+            self.lfbidCurrentItemLink = itemData and itemData.link or nil
+            self.lfbidCurrentItemSlot = itemData and itemData.slot or nil
+
+            local result = self.lfbidOriginalSetItem(self, itemData)
+            UpdateRollForRowActionButtonState(self)
+            return result
+        end
+    end
+
+    if frame.lfbidBidButton and frame.lfbidRollButton then
+        UpdateRollForRowActionButtonState(frame)
+        return
+    end
+
+    frame.lfbidBidButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    frame.lfbidBidButton:SetWidth(30)
+    frame.lfbidBidButton:SetHeight(16)
+    frame.lfbidBidButton:SetText("Bid")
+    frame.lfbidBidButton:SetPoint("RIGHT", frame, "RIGHT", -38, 0)
+    frame.lfbidBidButton:SetScript("OnClick", function()
+        if frame.lfbidCurrentItemLink and frame.lfbidCurrentItemLink ~= "" then
+            StartBiddingForItemLink(frame.lfbidCurrentItemLink, "points")
+        end
+    end)
+
+    frame.lfbidRollButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    frame.lfbidRollButton:SetWidth(30)
+    frame.lfbidRollButton:SetHeight(16)
+    frame.lfbidRollButton:SetText("Roll")
+    frame.lfbidRollButton:SetPoint("RIGHT", frame, "RIGHT", -4, 0)
+    frame.lfbidRollButton:SetScript("OnClick", function()
+        if frame.lfbidCurrentItemLink and frame.lfbidCurrentItemLink ~= "" then
+            StartBiddingForItemLink(frame.lfbidCurrentItemLink, "roll")
+        end
+    end)
+
+    UpdateRollForRowActionButtonState(frame)
+end
+
+local function HookRollForLootButtonsForLFBid()
+    local root = getglobal and getglobal("RollForLootFrame") or nil
+    local header = getglobal and getglobal("RollForLootFrameHeader") or nil
+    if not root and not header then
+        return
+    end
+
+    local visited = {}
+    local function HookFrameRecursive(frame)
+        if not frame or visited[frame] then
+            return
+        end
+        visited[frame] = true
+
+        EnsureRollForRowActionButtons(frame)
+        HookRollForFrameClickTarget(frame)
+
+        if frame.icon then
+            HookRollForFrameClickTarget(frame.icon)
+        end
+
+        if frame.comment then
+            HookRollForFrameClickTarget(frame.comment)
+        end
+
+        local children = { frame:GetChildren() }
+        local _, child
+        for _, child in ipairs(children) do
+            HookFrameRecursive(child)
+        end
+    end
+
+    if root then
+        HookFrameRecursive(root)
+    end
+    if header then
+        HookFrameRecursive(header)
+    end
+end
+
+local function BuildRollForLootMenuEntries()
+    lfbid_rollForMenuEntries = {}
+
+    if not GetNumLootItems or not GetLootSlotLink then
+        return
+    end
+
+    local lootCount = tonumber(GetNumLootItems()) or 0
+    local slot
+    for slot = 1, lootCount do
+        local itemLink = GetLootSlotLink(slot)
+        if itemLink and itemLink ~= "" then
+            table.insert(lfbid_rollForMenuEntries, {
+                slot = slot,
+                link = itemLink,
+            })
+        end
+    end
+end
+
+local function LFBidRollForMenu_OnStartPoints(link)
+    StartBiddingForItemLink(link, "points")
+end
+
+local function LFBidRollForMenu_OnStartRoll(link)
+    StartBiddingForItemLink(link, "roll")
+end
+
+local function LFBidRollForMenu_Initialize(_, level)
+    if not level or level ~= 1 then
+        return
+    end
+
+    local info = UIDropDownMenu_CreateInfo()
+    info.isTitle = 1
+    info.notCheckable = 1
+    info.text = "LFBid"
+    UIDropDownMenu_AddButton(info, level)
+
+    if not IsPlayerMasterLooter() then
+        info = UIDropDownMenu_CreateInfo()
+        info.notCheckable = 1
+        info.disabled = 1
+        info.text = "Master Looter only"
+        UIDropDownMenu_AddButton(info, level)
+        return
+    end
+
+    if lfbid_windowOpen then
+        info = UIDropDownMenu_CreateInfo()
+        info.notCheckable = 1
+        info.disabled = 1
+        info.text = "Close current LFBid window first"
+        UIDropDownMenu_AddButton(info, level)
+        return
+    end
+
+    if table.getn(lfbid_rollForMenuEntries) == 0 then
+        info = UIDropDownMenu_CreateInfo()
+        info.notCheckable = 1
+        info.disabled = 1
+        info.text = "No loot items found"
+        UIDropDownMenu_AddButton(info, level)
+        return
+    end
+
+    local _, entry
+    for _, entry in ipairs(lfbid_rollForMenuEntries) do
+        info = UIDropDownMenu_CreateInfo()
+        info.notCheckable = 1
+        info.text = "Bid: " .. tostring(entry.link)
+        info.func = function()
+            LFBidRollForMenu_OnStartPoints(entry.link)
+        end
+        UIDropDownMenu_AddButton(info, level)
+
+        info = UIDropDownMenu_CreateInfo()
+        info.notCheckable = 1
+        info.text = "Roll: " .. tostring(entry.link)
+        info.func = function()
+            LFBidRollForMenu_OnStartRoll(entry.link)
+        end
+        UIDropDownMenu_AddButton(info, level)
+    end
+end
+
+local function ShowRollForLFBidMenu(anchorFrame)
+    if not anchorFrame then
+        return
+    end
+
+    if not lfbid_rollForMenuFrame then
+        lfbid_rollForMenuFrame = CreateFrame("Frame", "LFBidRollForMenuFrame", UIParent, "UIDropDownMenuTemplate")
+        UIDropDownMenu_Initialize(lfbid_rollForMenuFrame, LFBidRollForMenu_Initialize, "MENU")
+    end
+
+    BuildRollForLootMenuEntries()
+    ToggleDropDownMenu(1, nil, lfbid_rollForMenuFrame, anchorFrame, 0, 0)
+end
+
+local function EnsureRollForIntegrationButton()
+    -- Intentionally disabled: keep row-level Bid/Roll buttons, but no top launcher button.
+    if lfbid_rollForButton then
+        lfbid_rollForButton:Hide()
+    end
+end
+
+local function ResolveRollForPopupItemLink(popupFrame)
+    if not popupFrame then
+        return nil
+    end
+
+    local popupItemName = nil
+    local function ScanFrame(frame)
+        if not frame or popupItemName then
+            return
+        end
+
+        if frame.GetText then
+            local text = tostring(frame:GetText() or "")
+            local _, _, foundName = string.find(text, "%[(.-)%]")
+            if foundName and foundName ~= "" then
+                popupItemName = foundName
+                return
+            end
+        end
+
+        if frame.GetChildren then
+            local children = { frame:GetChildren() }
+            local _, child
+            for _, child in ipairs(children) do
+                ScanFrame(child)
+                if popupItemName then
+                    return
+                end
+            end
+        end
+    end
+
+    ScanFrame(popupFrame)
+
+    if not GetNumLootItems or not GetLootSlotLink then
+        return nil
+    end
+
+    local lootCount = tonumber(GetNumLootItems()) or 0
+    local firstLink = nil
+    local slot
+    for slot = 1, lootCount do
+        local itemLink = GetLootSlotLink(slot)
+        if itemLink and itemLink ~= "" then
+            if not firstLink then
+                firstLink = itemLink
+            end
+
+            if popupItemName and string.find(itemLink, "[" .. popupItemName .. "]", 1, true) then
+                return itemLink
+            end
+        end
+    end
+
+    return firstLink
+end
+
+local function EnsureRollForPopupActionButtons()
+    local popup = getglobal and getglobal("RollForRollingFrame") or nil
+    if not popup then
+        return
+    end
+
+    if not lfbid_rollForPopupBidBtn then
+        lfbid_rollForPopupBidBtn = CreateFrame("Button", "LFBidRollForPopupBidButton", popup, "UIPanelButtonTemplate")
+        lfbid_rollForPopupBidBtn:SetWidth(34)
+        lfbid_rollForPopupBidBtn:SetHeight(20)
+        lfbid_rollForPopupBidBtn:SetText("Bid")
+        lfbid_rollForPopupBidBtn:SetScript("OnClick", function()
+            local itemLink = ResolveRollForPopupItemLink(popup)
+            if itemLink and itemLink ~= "" then
+                StartBiddingForItemLink(itemLink, "points")
+            end
+        end)
+    end
+
+    if not lfbid_rollForPopupRollBtn then
+        lfbid_rollForPopupRollBtn = CreateFrame("Button", "LFBidRollForPopupRollButton", popup, "UIPanelButtonTemplate")
+        lfbid_rollForPopupRollBtn:SetWidth(34)
+        lfbid_rollForPopupRollBtn:SetHeight(20)
+        lfbid_rollForPopupRollBtn:SetText("Roll")
+        lfbid_rollForPopupRollBtn:SetScript("OnClick", function()
+            local itemLink = ResolveRollForPopupItemLink(popup)
+            if itemLink and itemLink ~= "" then
+                StartBiddingForItemLink(itemLink, "roll")
+            end
+        end)
+    end
+
+    lfbid_rollForPopupRollBtn:ClearAllPoints()
+    lfbid_rollForPopupRollBtn:SetPoint("TOPLEFT", popup, "TOPLEFT", 8, -14)
+
+    lfbid_rollForPopupBidBtn:ClearAllPoints()
+    lfbid_rollForPopupBidBtn:SetPoint("TOPRIGHT", popup, "TOPRIGHT", -8, -14)
+
+    lfbid_rollForPopupBidBtn:SetFrameStrata(popup:GetFrameStrata() or "DIALOG")
+    lfbid_rollForPopupRollBtn:SetFrameStrata(popup:GetFrameStrata() or "DIALOG")
+    lfbid_rollForPopupBidBtn:SetFrameLevel((popup:GetFrameLevel() or 1) + 30)
+    lfbid_rollForPopupRollBtn:SetFrameLevel((popup:GetFrameLevel() or 1) + 30)
+
+    local itemLink = ResolveRollForPopupItemLink(popup)
+    local hasItem = itemLink and itemLink ~= ""
+    local canStart = hasItem and IsPlayerMasterLooter() and not lfbid_windowOpen
+
+    if hasItem then
+        lfbid_rollForPopupBidBtn:Show()
+        lfbid_rollForPopupRollBtn:Show()
+        if canStart then
+            lfbid_rollForPopupBidBtn:Enable()
+            lfbid_rollForPopupRollBtn:Enable()
+        else
+            lfbid_rollForPopupBidBtn:Disable()
+            lfbid_rollForPopupRollBtn:Disable()
+        end
+    else
+        lfbid_rollForPopupBidBtn:Hide()
+        lfbid_rollForPopupRollBtn:Hide()
+    end
+end
+
 local function RegisterLFBidLootWindowHook()
     if lfbid_lootHookFrame then
         return
@@ -3342,6 +3833,17 @@ local function RegisterLFBidLootWindowHook()
     lfbid_lootHookFrame:RegisterEvent("LOOT_OPENED")
     lfbid_lootHookFrame:SetScript("OnEvent", function()
         HookLootButtonsForLFBid()
+        HookRollForLootButtonsForLFBid()
+        EnsureRollForIntegrationButton()
+        EnsureRollForPopupActionButtons()
+    end)
+    lfbid_lootHookFrame:SetScript("OnUpdate", function()
+        lfbid_rollForPopupUpdateElapsed = lfbid_rollForPopupUpdateElapsed + (arg1 or 0)
+        if lfbid_rollForPopupUpdateElapsed < 0.2 then
+            return
+        end
+        lfbid_rollForPopupUpdateElapsed = 0
+        EnsureRollForPopupActionButtons()
     end)
 
     if not lfbid_originalLootFrameUpdate and type(LootFrame_Update) == "function" then
@@ -3349,11 +3851,17 @@ local function RegisterLFBidLootWindowHook()
         LootFrame_Update = function()
             local result = lfbid_originalLootFrameUpdate()
             HookLootButtonsForLFBid()
+            HookRollForLootButtonsForLFBid()
+            EnsureRollForIntegrationButton()
+            EnsureRollForPopupActionButtons()
             return result
         end
     end
 
     HookLootButtonsForLFBid()
+    HookRollForLootButtonsForLFBid()
+    EnsureRollForIntegrationButton()
+    EnsureRollForPopupActionButtons()
 end
 
 local function ResolveMasterLootMenuSlot()
