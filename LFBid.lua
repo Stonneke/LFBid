@@ -21,6 +21,7 @@ local lfbid_bids = {}
 local lfbid_rollSeen = {}
 local LFBID_ADDON_PREFIX = "LFBid"
 local LFDKP_ADDON_PREFIX = "LFDKP"
+local LFBID_ENABLE_DKP_DELTA_SYNC = false
 local lfbid_backdropAlpha = 0.30
 local lfbid_useDKPCheck = 1
 local lfbid_dkpCheckTier = 1
@@ -3186,6 +3187,10 @@ lfbid_openSyncFrame:SetScript("OnEvent", function(_, eventName, p1, p2, p3, p4)
     -- External addon can push DKP changes in RAID addon channel: "Player +/- Points".
     -- Only process DKP changes from the LFDKP prefix.
     if channel == "RAID" and prefix == LFDKP_ADDON_PREFIX then
+        if not LFBID_ENABLE_DKP_DELTA_SYNC then
+            return
+        end
+
         local dkpPlayer, dkpDelta = ParseDKPDeltaMessage(msg)
         if dkpPlayer and dkpDelta then
             if ApplyDKPDelta(dkpPlayer, dkpDelta) and lfbid_windowOpen then
