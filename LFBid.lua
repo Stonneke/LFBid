@@ -22,6 +22,8 @@ local lfbid_rollSeen = {}
 local LFBID_ADDON_PREFIX = "LFBid"
 local LFDKP_ADDON_PREFIX = "LFDKP"
 local LFBID_ENABLE_DKP_DELTA_SYNC = false
+local LFBID_ENABLE_ROLLFOR_ROW_BUTTONS = false
+local LFBID_ENABLE_ROLLFOR_POPUP_BUTTONS = true
 local lfbid_backdropAlpha = 0.30
 local lfbid_useDKPCheck = 1
 local lfbid_dkpCheckTier = 1
@@ -3595,6 +3597,16 @@ local function EnsureRollForRowActionButtons(frame)
         return
     end
 
+    if not LFBID_ENABLE_ROLLFOR_ROW_BUTTONS then
+        if frame.lfbidBidButton then
+            frame.lfbidBidButton:Hide()
+        end
+        if frame.lfbidRollButton then
+            frame.lfbidRollButton:Hide()
+        end
+        return
+    end
+
     if not frame.lfbidOriginalSetItem then
         frame.lfbidOriginalSetItem = frame.SetItem
         frame.SetItem = function(self, itemData)
@@ -3842,6 +3854,16 @@ local function ResolveRollForPopupItemLink(popupFrame)
 end
 
 local function EnsureRollForPopupActionButtons()
+    if not LFBID_ENABLE_ROLLFOR_POPUP_BUTTONS then
+        if lfbid_rollForPopupBidBtn then
+            lfbid_rollForPopupBidBtn:Hide()
+        end
+        if lfbid_rollForPopupRollBtn then
+            lfbid_rollForPopupRollBtn:Hide()
+        end
+        return
+    end
+
     local popup = getglobal and getglobal("RollForRollingFrame") or nil
     if not popup then
         return
