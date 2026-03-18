@@ -214,12 +214,54 @@ local function ItemTextForAnnouncement(itemText)
     return text
 end
 
+local lfbid_scanTooltip
+
+local function PrimeItemTooltipCache(itemLink)
+    if not itemLink or itemLink == "" then
+        return
+    end
+
+    if not lfbid_scanTooltip then
+        lfbid_scanTooltip = CreateFrame("GameTooltip", "LFBidScanTooltip", nil, "GameTooltipTemplate")
+    end
+
+    if lfbid_scanTooltip and lfbid_scanTooltip.SetOwner and lfbid_scanTooltip.SetHyperlink then
+        lfbid_scanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+        pcall(lfbid_scanTooltip.SetHyperlink, lfbid_scanTooltip, itemLink)
+    end
+end
+
 local function ShowItemTooltip(anchorFrame, itemLink)
     if not anchorFrame or not itemLink or itemLink == "" then
         return
     end
+
+    if not string.find(itemLink, "|Hitem:", 1, true) then
+        GameTooltip:SetOwner(anchorFrame, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Unknown item")
+        GameTooltip:Show()
+        return
+    end
+
+    if GetItemInfo then
+        local itemName = GetItemInfo(itemLink)
+        if not itemName then
+            PrimeItemTooltipCache(itemLink)
+        end
+    else
+        PrimeItemTooltipCache(itemLink)
+    end
+
     GameTooltip:SetOwner(anchorFrame, "ANCHOR_RIGHT")
-    GameTooltip:SetHyperlink(itemLink)
+    local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, itemLink)
+    if not ok then
+        local _, _, itemName = string.find(itemLink, "|h%[(.-)%]|h")
+        if itemName and itemName ~= "" then
+            GameTooltip:SetText(itemName)
+        else
+            GameTooltip:SetText("Item details unavailable")
+        end
+    end
     GameTooltip:Show()
 end
 
