@@ -216,6 +216,17 @@ end
 
 local lfbid_scanTooltip
 
+-- Extract the raw itemstring (e.g. "item:12345:0:0:0") from a full colored
+-- hyperlink (e.g. "|cffFFD100|Hitem:12345:0:0:0|h[Name]|h|r").
+-- GameTooltip:SetHyperlink expects the raw itemstring, not the colored link;
+-- passing the full link breaks tooltips inconsistently across different clients.
+-- This mirrors how aux-addon parses links in util/info.lua (parse_link /
+-- itemstring) before calling SetHyperlink.
+local function ExtractItemString(itemLink)
+    local _, _, itemStr = string.find(itemLink, "|H([^|]+)|h")
+    return itemStr
+end
+
 local function PrimeItemTooltipCache(itemLink)
     if not itemLink or itemLink == "" then
         return
@@ -225,9 +236,10 @@ local function PrimeItemTooltipCache(itemLink)
         lfbid_scanTooltip = CreateFrame("GameTooltip", "LFBidScanTooltip", nil, "GameTooltipTemplate")
     end
 
+    local itemStr = ExtractItemString(itemLink) or itemLink
     if lfbid_scanTooltip and lfbid_scanTooltip.SetOwner and lfbid_scanTooltip.SetHyperlink then
         lfbid_scanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
-        pcall(lfbid_scanTooltip.SetHyperlink, lfbid_scanTooltip, itemLink)
+        pcall(lfbid_scanTooltip.SetHyperlink, lfbid_scanTooltip, itemStr)
     end
 end
 
@@ -243,8 +255,10 @@ local function ShowItemTooltip(anchorFrame, itemLink)
         return
     end
 
+    local itemStr = ExtractItemString(itemLink) or itemLink
+
     if GetItemInfo then
-        local itemName = GetItemInfo(itemLink)
+        local itemName = GetItemInfo(itemStr)
         if not itemName then
             PrimeItemTooltipCache(itemLink)
         end
@@ -253,7 +267,7 @@ local function ShowItemTooltip(anchorFrame, itemLink)
     end
 
     GameTooltip:SetOwner(anchorFrame, "ANCHOR_RIGHT")
-    local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, itemLink)
+    local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, itemStr)
     if not ok then
         local _, _, itemName = string.find(itemLink, "|h%[(.-)%]|h")
         if itemName and itemName ~= "" then

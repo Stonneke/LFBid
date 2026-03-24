@@ -2,7 +2,7 @@
 ## Title: LF DKP Bid
 ## Notes: Used for loot bidding
 ## Author: LF Tent
-## Version: 2.05
+## Version: 2.06
 ## SavedVariables: RaidMembersData, RaidTrackerMinimapButtonDB, LFTentDKP
 
 DKPData.lua
