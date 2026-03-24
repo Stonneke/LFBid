@@ -51,7 +51,7 @@ local lfbid_pendingManualWinnerBid = nil
 local lfbid_manualWinnerCostText = ""
 local LFBID_STATUS_REQUEST_PREFIX = "STATUSREQ:"
 local LFBID_STATUS_RESPONSE_PREFIX = "STATUSRES:"
-local LFBID_VERSION = "2.09"
+local LFBID_VERSION = "2.10"
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
@@ -4509,18 +4509,49 @@ local function ResolveRollForPopupItemLink(popupFrame)
         return nil
     end
 
+    local popupItemLink = nil
     local popupItemName = nil
+
+    local function ConsumeText(text)
+        local textValue = tostring(text or "")
+        if textValue == "" then
+            return
+        end
+
+        if not popupItemLink then
+            local _, _, foundLink = string.find(textValue, "(|Hitem:.-|h%[.-%]|h)")
+            if foundLink and foundLink ~= "" then
+                popupItemLink = foundLink
+            end
+        end
+
+        if not popupItemName then
+            local _, _, foundName = string.find(textValue, "%[(.-)%]")
+            if foundName and foundName ~= "" then
+                popupItemName = foundName
+            end
+        end
+    end
+
     local function ScanFrame(frame)
-        if not frame or popupItemName then
+        if not frame or (popupItemLink and popupItemName) then
             return
         end
 
         if frame.GetText then
-            local text = tostring(frame:GetText() or "")
-            local _, _, foundName = string.find(text, "%[(.-)%]")
-            if foundName and foundName ~= "" then
-                popupItemName = foundName
-                return
+            ConsumeText(frame:GetText())
+        end
+
+        if frame.GetRegions then
+            local regions = { frame:GetRegions() }
+            local _, region
+            for _, region in ipairs(regions) do
+                if region and region.GetText then
+                    ConsumeText(region:GetText())
+                    if popupItemLink and popupItemName then
+                        return
+                    end
+                end
             end
         end
 
@@ -4529,7 +4560,7 @@ local function ResolveRollForPopupItemLink(popupFrame)
             local _, child
             for _, child in ipairs(children) do
                 ScanFrame(child)
-                if popupItemName then
+                if popupItemLink and popupItemName then
                     return
                 end
             end
@@ -4538,27 +4569,45 @@ local function ResolveRollForPopupItemLink(popupFrame)
 
     ScanFrame(popupFrame)
 
-    if not GetNumLootItems or not GetLootSlotLink then
-        return nil
-    end
+    -- Always prefer GetLootSlotLink (fully colored) over the text-scanned link.
+    -- The text scan only extracts the |Hitem:...|h part without color codes.
+    if GetNumLootItems and GetLootSlotLink then
+        local lootCount = tonumber(GetNumLootItems()) or 0
+        local normalizedPopupName = string.lower(tostring(popupItemName or ""))
+        normalizedPopupName = string.gsub(normalizedPopupName, "^%s+", "")
+        normalizedPopupName = string.gsub(normalizedPopupName, "%s+$", "")
 
-    local lootCount = tonumber(GetNumLootItems()) or 0
-    local firstLink = nil
-    local slot
-    for slot = 1, lootCount do
-        local itemLink = GetLootSlotLink(slot)
-        if itemLink and itemLink ~= "" then
-            if not firstLink then
-                firstLink = itemLink
-            end
+        local onlyLink = nil
+        local foundCount = 0
+        local slot
+        for slot = 1, lootCount do
+            local itemLink = GetLootSlotLink(slot)
+            if itemLink and itemLink ~= "" then
+                foundCount = foundCount + 1
+                onlyLink = itemLink
 
-            if popupItemName and string.find(itemLink, "[" .. popupItemName .. "]", 1, true) then
-                return itemLink
+                if normalizedPopupName ~= "" then
+                    local _, _, lootItemName = string.find(itemLink, "|h%[(.-)%]|h")
+                    local normalizedLootName = string.lower(tostring(lootItemName or ""))
+                    if normalizedLootName == normalizedPopupName then
+                        return itemLink
+                    end
+                end
             end
+        end
+
+        -- Exactly one loot item: deterministic match, safe to use.
+        if foundCount == 1 then
+            return onlyLink
         end
     end
 
-    return firstLink
+    -- Fall back to the link extracted directly from popup text (may lack color codes).
+    if popupItemLink and popupItemLink ~= "" then
+        return popupItemLink
+    end
+
+    return nil
 end
 
 local function EnsureRollForPopupActionButtons()
@@ -4586,6 +4635,8 @@ local function EnsureRollForPopupActionButtons()
             local itemLink = ResolveRollForPopupItemLink(popup)
             if itemLink and itemLink ~= "" then
                 StartBiddingForItemLink(itemLink, "points")
+            else
+                print("LFBid: Could not resolve the RollFor popup item.")
             end
         end)
     end
@@ -4599,6 +4650,8 @@ local function EnsureRollForPopupActionButtons()
             local itemLink = ResolveRollForPopupItemLink(popup)
             if itemLink and itemLink ~= "" then
                 StartBiddingForItemLink(itemLink, "roll")
+            else
+                print("LFBid: Could not resolve the RollFor popup item.")
             end
         end)
     end
@@ -4614,23 +4667,16 @@ local function EnsureRollForPopupActionButtons()
     lfbid_rollForPopupBidBtn:SetFrameLevel((popup:GetFrameLevel() or 1) + 30)
     lfbid_rollForPopupRollBtn:SetFrameLevel((popup:GetFrameLevel() or 1) + 30)
 
-    local itemLink = ResolveRollForPopupItemLink(popup)
-    local hasItem = itemLink and itemLink ~= ""
-    local canStart = hasItem and IsPlayerMasterLooter() and not lfbid_windowOpen
+    local canStart = IsPlayerMasterLooter() and not lfbid_windowOpen
 
-    if hasItem then
-        lfbid_rollForPopupBidBtn:Show()
-        lfbid_rollForPopupRollBtn:Show()
-        if canStart then
-            lfbid_rollForPopupBidBtn:Enable()
-            lfbid_rollForPopupRollBtn:Enable()
-        else
-            lfbid_rollForPopupBidBtn:Disable()
-            lfbid_rollForPopupRollBtn:Disable()
-        end
+    lfbid_rollForPopupBidBtn:Show()
+    lfbid_rollForPopupRollBtn:Show()
+    if canStart then
+        lfbid_rollForPopupBidBtn:Enable()
+        lfbid_rollForPopupRollBtn:Enable()
     else
-        lfbid_rollForPopupBidBtn:Hide()
-        lfbid_rollForPopupRollBtn:Hide()
+        lfbid_rollForPopupBidBtn:Disable()
+        lfbid_rollForPopupRollBtn:Disable()
     end
 end
 
