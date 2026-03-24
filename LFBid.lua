@@ -51,7 +51,7 @@ local lfbid_pendingManualWinnerBid = nil
 local lfbid_manualWinnerCostText = ""
 local LFBID_STATUS_REQUEST_PREFIX = "STATUSREQ:"
 local LFBID_STATUS_RESPONSE_PREFIX = "STATUSRES:"
-local LFBID_VERSION = "2.10"
+local LFBID_VERSION = "2.11"
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
@@ -1480,10 +1480,10 @@ local function CancelBidding()
         return
     end
 
-    local itemText = ItemTextForAnnouncement(lfbid_activeItem or "")
     local message
-    if itemText and itemText ~= "" then
-        message = itemText .. " bidding is cancelled"
+    local activeLink = tostring(lfbid_activeItem or "")
+    if activeLink ~= "" then
+        message = activeLink .. " bidding is cancelled"
     else
         message = "Bidding is cancelled"
     end
@@ -4092,6 +4092,7 @@ local lfbid_originalLootFrameUpdate = nil
 local lfbid_masterLootDropdownHooked = false
 local lfbid_masterLootOriginalInitialize = nil
 local lfbid_masterLootMenuSlot = nil
+local lfbid_masterLootMenuItemLink = nil
 local lfbid_debugEnabled = false
 local lfbid_toggleDropDownHooked = false
 local lfbid_originalToggleDropDownMenu = nil
@@ -4768,6 +4769,9 @@ local function StartBiddingFromMasterLootMenu(mode)
     end
 
     local itemLink = GetLootSlotLink(slotId)
+    if (not itemLink or itemLink == "") and lfbid_masterLootMenuItemLink and lfbid_masterLootMenuItemLink ~= "" then
+        itemLink = lfbid_masterLootMenuItemLink
+    end
     LFBidDebug("Resolved loot slot link: " .. tostring(itemLink))
     if not itemLink or itemLink == "" then
         print("LFBid: No item link found for selected loot slot.")
@@ -4788,10 +4792,14 @@ local function AddLFBidEntriesToMasterLootDropdown(level)
     end
 
     lfbid_masterLootMenuSlot = nil
+    lfbid_masterLootMenuItemLink = nil
     if LootFrame and LootFrame.selectedSlot and tonumber(LootFrame.selectedSlot) then
         lfbid_masterLootMenuSlot = tonumber(LootFrame.selectedSlot)
     elseif MasterLootDropDown and MasterLootDropDown.slot and tonumber(MasterLootDropDown.slot) then
         lfbid_masterLootMenuSlot = tonumber(MasterLootDropDown.slot)
+    end
+    if lfbid_masterLootMenuSlot and GetLootSlotLink then
+        lfbid_masterLootMenuItemLink = GetLootSlotLink(lfbid_masterLootMenuSlot)
     end
     LFBidDebug("Master loot menu slot captured: " .. tostring(lfbid_masterLootMenuSlot))
 
