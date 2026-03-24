@@ -42,6 +42,7 @@ local lfbid_bidListMaxOffset = 0
 local lfbid_specScrollOffsets = {}
 local lfbid_hoveredSpec = nil
 local lfbid_openAltBid = false
+local lfbid_openTmogBid = false
 local LFBID_ROLL_VISIBLE_ROWS = 10
 local LFBID_POINTS_VISIBLE_ROWS = 6
 local lfbid_pendingWinnerAnnouncement = nil
@@ -50,12 +51,54 @@ local lfbid_pendingManualWinnerBid = nil
 local lfbid_manualWinnerCostText = ""
 local LFBID_STATUS_REQUEST_PREFIX = "STATUSREQ:"
 local LFBID_STATUS_RESPONSE_PREFIX = "STATUSRES:"
-local LFBID_VERSION = "2.08"
+local LFBID_VERSION = "2.09"
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
 local OpenLFBidWindow
 local StartBiddingForItemLink
+
+local function PersistLFBidSettings()
+    if type(LFBidSettings) ~= "table" then
+        LFBidSettings = {}
+    end
+
+    LFBidSettings.backdropAlpha = tonumber(lfbid_backdropAlpha) or 0.30
+    LFBidSettings.useDKPCheck = lfbid_useDKPCheck and 1 or 0
+    LFBidSettings.dkpCheckTier = (lfbid_dkpCheckTier == 2) and 2 or 1
+    LFBidSettings.openAltBid = lfbid_openAltBid and 1 or 0
+    LFBidSettings.openTmogBid = lfbid_openTmogBid and 1 or 0
+end
+
+local function LoadLFBidSettings()
+    if type(LFBidSettings) ~= "table" then
+        LFBidSettings = {}
+    end
+
+    local alpha = tonumber(LFBidSettings.backdropAlpha)
+    if alpha and alpha >= 0 and alpha <= 1 then
+        lfbid_backdropAlpha = alpha
+    end
+
+    if tonumber(LFBidSettings.useDKPCheck) == 1 then
+        lfbid_useDKPCheck = 1
+    else
+        lfbid_useDKPCheck = nil
+    end
+
+    local tier = tonumber(LFBidSettings.dkpCheckTier)
+    if tier == 2 then
+        lfbid_dkpCheckTier = 2
+    else
+        lfbid_dkpCheckTier = 1
+    end
+
+    lfbid_openAltBid = tonumber(LFBidSettings.openAltBid) == 1
+    lfbid_openTmogBid = tonumber(LFBidSettings.openTmogBid) == 1
+
+    -- Write back defaults so the table always has a complete shape.
+    PersistLFBidSettings()
+end
 
 local function ApplyLFBidBackdropAlpha()
     if LFbidFrame then
@@ -107,14 +150,27 @@ local function ParseBidMessage(msg, fallbackName)
     end
 
     local altBid = false
-    local lastToken = tokens[table.getn(tokens)]
-    if lastToken and string.lower(lastToken) == "alt" then
-        altBid = true
-        table.remove(tokens)
+    local tmogBid = false
+    while table.getn(tokens) > 0 do
+        local lastToken = tokens[table.getn(tokens)]
+        local lastLower = string.lower(tostring(lastToken or ""))
+        if lastLower == "alt" then
+            altBid = true
+            table.remove(tokens)
+        elseif lastLower == "tmog" or lastLower == "t-mog" then
+            tmogBid = true
+            table.remove(tokens)
+        else
+            break
+        end
     end
 
     if table.getn(tokens) < 1 then
-        return nil, nil, nil, false
+        local onlyName = NormalizeBidderName(fallbackName)
+        if onlyName ~= "" and tmogBid then
+            return onlyName, nil, nil, altBid and true or false, true
+        end
+        return nil, nil, nil, false, false
     end
 
     local points
@@ -141,6 +197,7 @@ local function ParseBidMessage(msg, fallbackName)
         if only == "tmog" or only == "t-mog" then
             points = 0
             spec = tokens[1]
+            tmogBid = true
         end
     end
 
@@ -165,10 +222,35 @@ local function ParseBidMessage(msg, fallbackName)
     end
 
     if finalName == "" or points == nil or not spec or spec == "" then
-        return nil, nil, nil, false
+        if finalName ~= "" and tmogBid then
+            return finalName, nil, nil, altBid and true or false, true
+        end
+        return nil, nil, nil, false, false
     end
 
-    return finalName, points, spec, altBid and true or false
+    return finalName, points, spec, altBid and true or false, tmogBid and true or false
+end
+
+local function GenerateRandomTmogRoll()
+    local roll = 1
+    local randomFunc
+    if math and math.random then
+        randomFunc = math.random
+    elseif random then
+        randomFunc = random
+    end
+
+    if randomFunc then
+        roll = tonumber(randomFunc(1, 100)) or 1
+    end
+
+    if roll < 1 then
+        roll = 1
+    elseif roll > 100 then
+        roll = 100
+    end
+
+    return roll
 end
 
 local function ParseSystemRollMessage(msg)
@@ -648,6 +730,28 @@ local function NormalizeSpec(spec)
     return string.upper(first) .. string.lower(rest)
 end
 
+local function HasPrimaryMSBids()
+    for _, bid in ipairs(lfbid_bids) do
+        if bid and NormalizeSpec(bid.spec) == "MS" then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function GetEffectiveBidSpec(spec, hasPrimaryMSBids)
+    local normalized = NormalizeSpec(spec)
+    if normalized == "X" then
+        if hasPrimaryMSBids then
+            return "MS"
+        end
+        return "OS"
+    end
+
+    return normalized
+end
+
 local function FindDKPPlayerKey(playerName)
     if type(LFTentDKP) ~= "table" then
         return nil
@@ -843,6 +947,8 @@ local function SetDKPCheckTier(tier)
     if LFbidFrame and LFbidFrame.gridCells then
         RefreshLFBidBidList()
     end
+
+    PersistLFBidSettings()
 end
 
 local function RemoveExistingBidForPlayer(playerName)
@@ -918,6 +1024,7 @@ local function StartLFBidMessageTimer(messages, intervalOrIntervals, onDone)
 end
 
 local function ResolvePointsAuctionOutcome()
+    local hasPrimaryMSBids = HasPrimaryMSBids()
     local buckets = {
         ["MS"] = {},
         ["OS"] = {},
@@ -926,13 +1033,15 @@ local function ResolvePointsAuctionOutcome()
     local priority = {"MS", "OS", "T-MOG"}
 
     for _, bid in ipairs(lfbid_bids) do
-        local spec = NormalizeSpec(bid and bid.spec)
+        local originalSpec = NormalizeSpec(bid and bid.spec)
+        local spec = GetEffectiveBidSpec(originalSpec, hasPrimaryMSBids)
         local points = tonumber(bid and bid.points)
         if buckets[spec] and points then
             table.insert(buckets[spec], {
                 name = tostring(bid.name or ""),
                 points = points,
                 spec = spec,
+                originalSpec = originalSpec,
             })
         end
     end
@@ -967,11 +1076,15 @@ local function ResolvePointsAuctionOutcome()
     local winnerBid = tonumber(winner.points) or 0
 
     local tiedTop = {}
+    local tieIncludesX = false
     local _, bidEntry
     for _, bidEntry in ipairs(selectedBids) do
         local bidPoints = tonumber(bidEntry and bidEntry.points) or 0
         if bidPoints == winnerBid then
             table.insert(tiedTop, tostring(bidEntry.name or ""))
+            if NormalizeSpec(bidEntry and bidEntry.originalSpec) == "X" then
+                tieIncludesX = true
+            end
         else
             break
         end
@@ -988,20 +1101,28 @@ local function ResolvePointsAuctionOutcome()
             winnerSpec = selectedSpec,
             winnerBid = winnerBid,
             cost = winnerBid,
+            tieIncludesX = tieIncludesX,
             itemLink = tostring(lfbid_activeItem or ""),
         }
     end
 
+    local winnerIsX = NormalizeSpec(winner.originalSpec) == "X"
     if table.getn(selectedBids) >= 2 then
         local secondBid = tonumber(selectedBids[2].points) or 0
 
-        -- If top bids are tied, winner pays the tied bid amount.
-        -- Only unique top bids use second-highest + 1.
-        if winnerBid == secondBid then
-            cost = winnerBid
+        if winnerIsX then
+            cost = (secondBid + 1) * 2
         else
-            cost = secondBid + 1
+            -- If top bids are tied, winner pays the tied bid amount.
+            -- Only unique top bids use second-highest + 1.
+            if winnerBid == secondBid then
+                cost = winnerBid
+            else
+                cost = secondBid + 1
+            end
         end
+    elseif winnerIsX then
+        cost = 0
     end
     if cost < 1 then
         cost = 1
@@ -1032,7 +1153,13 @@ local function SendWinnerAnnouncement(outcome)
     local message
     if outcome.isTie and outcome.tieNames and table.getn(outcome.tieNames) >= 2 then
         local names = table.concat(outcome.tieNames, ", ")
-        if itemText and itemText ~= "" then
+        if outcome.tieIncludesX then
+            if itemText and itemText ~= "" then
+                message = itemText .. " tied between " .. names .. ". Roll for it"
+            else
+                message = "Tie between " .. names .. ". Roll for it"
+            end
+        elseif itemText and itemText ~= "" then
             message = itemText .. " tied between " .. names .. ". Roll for it for " .. tostring(outcome.cost) .. " DKP"
         else
             message = "Tie between " .. names .. ". Roll for it for " .. tostring(outcome.cost) .. " DKP"
@@ -1316,7 +1443,11 @@ local function CloseBidding()
                     lfbid_pendingWinnerAnnouncement = pointsOutcome
                     local confirmText
                     if pointsOutcome.isTie and pointsOutcome.tieNames and table.getn(pointsOutcome.tieNames) >= 2 then
-                        confirmText = "Tie: " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Announce roll-off for " .. tostring(pointsOutcome.cost) .. " DKP?"
+                        if pointsOutcome.tieIncludesX then
+                            confirmText = "Tie: " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Announce roll-off?"
+                        else
+                            confirmText = "Tie: " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Announce roll-off for " .. tostring(pointsOutcome.cost) .. " DKP?"
+                        end
                     else
                         confirmText = tostring(pointsOutcome.winnerName) .. " won for " .. tostring(pointsOutcome.cost) .. " DKP, announce?"
                     end
@@ -1327,7 +1458,11 @@ local function CloseBidding()
                     end
                 else
                     if pointsOutcome.isTie and pointsOutcome.tieNames and table.getn(pointsOutcome.tieNames) >= 2 then
-                        print("LFBid: Tie between " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Roll-off for " .. tostring(pointsOutcome.cost) .. " DKP.")
+                        if pointsOutcome.tieIncludesX then
+                            print("LFBid: Tie between " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Roll-off required.")
+                        else
+                            print("LFBid: Tie between " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Roll-off for " .. tostring(pointsOutcome.cost) .. " DKP.")
+                        end
                     else
                         print("LFBid: Winner is " .. tostring(pointsOutcome.winnerName) .. " for " .. tostring(pointsOutcome.cost) .. " DKP.")
                     end
@@ -1337,6 +1472,44 @@ local function CloseBidding()
             end
         end
     end)
+end
+
+local function CancelBidding()
+    if not lfbid_biddingOpen then
+        print("LFBid: Bidding is not active.")
+        return
+    end
+
+    local itemText = ItemTextForAnnouncement(lfbid_activeItem or "")
+    local message
+    if itemText and itemText ~= "" then
+        message = itemText .. " bidding is cancelled"
+    else
+        message = "Bidding is cancelled"
+    end
+
+    if GetNumRaidMembers and GetNumRaidMembers() and GetNumRaidMembers() > 0 then
+        SendSafeChatMessage(message, "RAID_WARNING")
+    elseif GetNumPartyMembers and GetNumPartyMembers() and GetNumPartyMembers() > 0 then
+        SendSafeChatMessage(message, "PARTY")
+    else
+        print("LFBid: " .. message)
+    end
+
+    lfbid_biddingOpen = false
+    lfbid_rollSeen = {}
+    lfbid_bids = {}
+    lfbid_pendingWinnerAnnouncement = nil
+    lfbid_manualWinnerSelectionActive = false
+    lfbid_pendingManualWinnerBid = nil
+    SendBiddingCloseMessage()
+
+    if RefreshMasterLootButtons then
+        RefreshMasterLootButtons()
+    end
+    if RefreshLFBidBidList then
+        RefreshLFBidBidList()
+    end
 end
 
 local function StartPointsBiddingFromMasterWindow()
@@ -1413,6 +1586,7 @@ local function StartPointsBiddingFromMasterWindow()
     SendSafeChatMessage("Start bidding on item: " .. lfbid_activeItem, "RAID_WARNING")
     local whisperTarget = GetCurrentLootMasterName() or UnitName("player") or "ML"
     SendSafeChatMessage("Bid via /w " .. tostring(whisperTarget) .. " <spec> <points> (example: MS 25)", "RAID_WARNING")
+    SendSafeChatMessage("TMOG via /w " .. tostring(whisperTarget) .. " TMOG or MS 10 TMOG", "RAID_WARNING")
 
     if RefreshMasterLootButtons then
         RefreshMasterLootButtons()
@@ -1448,6 +1622,14 @@ RefreshMasterLootButtons = function()
             LFbidFrame.stopBtn:Enable()
         else
             LFbidFrame.stopBtn:Disable()
+        end
+    end
+
+    if LFbidFrame.cancelBtn then
+        if lfbid_biddingOpen then
+            LFbidFrame.cancelBtn:Enable()
+        else
+            LFbidFrame.cancelBtn:Disable()
         end
     end
 
@@ -1780,9 +1962,11 @@ RefreshLFBidBidList = function()
         OS = true,
     }
 
+    local hasPrimaryMSBids = HasPrimaryMSBids()
+
     for _, bid in ipairs(lfbid_bids) do
         if bid then
-            local normalized = NormalizeSpec(bid.spec)
+            local normalized = GetEffectiveBidSpec(bid.spec, hasPrimaryMSBids)
             if not grouped[normalized] then
                 grouped[normalized] = {}
             end
@@ -1864,9 +2048,11 @@ RefreshLFBidBidList = function()
                 elseif not BidHasEnoughDKP(bid) then
                     nameText = "|cffff2020" .. nameText .. "|r"
                 end
-                local line = pointsText .. " -- " .. nameText
-                if bid.altBid then
-                    line = pointsText .. " - ALT - " .. nameText
+                local line = pointsText .. " " .. nameText
+                if NormalizeSpec(bid.spec) == "X" then
+                    line = pointsText .. " X " .. nameText
+                elseif bid.altBid then
+                    line = pointsText .. " ALT " .. nameText
                 end
                 table.insert(lines, line)
                 table.insert(visibleBids, bid)
@@ -2123,8 +2309,8 @@ local function LFBidOpenDropDown_Initialize(frame, level)
     UIDropDownMenu_AddButton(info, level)
 
     info = UIDropDownMenu_CreateInfo()
-    info.text = "T-MOG"
-    info.value = "T-MOG"
+    info.text = "X"
+    info.value = "X"
     info.func = LFBidOpenDropDown_OnClick
     UIDropDownMenu_AddButton(info, level)
 end
@@ -2157,8 +2343,8 @@ local function LFBidMLBidDropDown_Initialize(frame, level)
     UIDropDownMenu_AddButton(info, level)
 
     info = UIDropDownMenu_CreateInfo()
-    info.text = "T-MOG"
-    info.value = "T-MOG"
+    info.text = "X"
+    info.value = "X"
     info.func = LFBidMLBidDropDown_OnClick
     UIDropDownMenu_AddButton(info, level)
 end
@@ -2195,8 +2381,8 @@ local function OpenLFBidOpenWindow()
         lfbid_openFrame.alphaSlider:SetWidth(120)
         lfbid_openFrame.alphaSlider:SetHeight(14)
         lfbid_openFrame.alphaSlider:SetPoint("TOPLEFT", lfbid_openFrame, "TOPLEFT", 150, -16)
-        lfbid_openFrame.alphaSlider:SetMinMaxValues(0.05, 0.90)
-        lfbid_openFrame.alphaSlider:SetValueStep(0.05)
+        lfbid_openFrame.alphaSlider:SetMinMaxValues(0, 1)
+        lfbid_openFrame.alphaSlider:SetValueStep(0.01)
         lfbid_openFrame.alphaSlider:SetValue(lfbid_backdropAlpha)
         lfbid_openFrame.alphaSlider:SetScript("OnValueChanged", function()
             local value = arg1
@@ -2206,16 +2392,19 @@ local function OpenLFBidOpenWindow()
             if value then
                 lfbid_backdropAlpha = value
                 ApplyLFBidBackdropAlpha()
+                PersistLFBidSettings()
             end
         end)
         if getglobal("LFBidOpenAlphaSliderText") then
             getglobal("LFBidOpenAlphaSliderText"):SetText("Background")
         end
         if getglobal("LFBidOpenAlphaSliderLow") then
-            getglobal("LFBidOpenAlphaSliderLow"):SetText("5%")
+            getglobal("LFBidOpenAlphaSliderLow"):SetText("")
+            getglobal("LFBidOpenAlphaSliderLow"):Hide()
         end
         if getglobal("LFBidOpenAlphaSliderHigh") then
-            getglobal("LFBidOpenAlphaSliderHigh"):SetText("90%")
+            getglobal("LFBidOpenAlphaSliderHigh"):SetText("")
+            getglobal("LFBidOpenAlphaSliderHigh"):Hide()
         end
 
         lfbid_openFrame.pointsLabel = lfbid_openFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -2272,9 +2461,23 @@ local function OpenLFBidOpenWindow()
         lfbid_openFrame.altCheck:SetChecked(lfbid_openAltBid and 1 or nil)
         lfbid_openFrame.altCheck:SetScript("OnClick", function()
             lfbid_openAltBid = this:GetChecked() and true or false
+            PersistLFBidSettings()
         end)
         if getglobal("LFBidOpenAltCheckButtonText") then
             getglobal("LFBidOpenAltCheckButtonText"):SetText("ALT")
+        end
+
+        lfbid_openFrame.tmogCheck = CreateFrame("CheckButton", "LFBidOpenTMOGCheckButton", lfbid_openFrame, "UICheckButtonTemplate")
+        lfbid_openFrame.tmogCheck:SetPoint("LEFT", lfbid_openFrame.altCheck, "RIGHT", 26, 0)
+        lfbid_openFrame.tmogCheck:SetWidth(24)
+        lfbid_openFrame.tmogCheck:SetHeight(24)
+        lfbid_openFrame.tmogCheck:SetChecked(lfbid_openTmogBid and 1 or nil)
+        lfbid_openFrame.tmogCheck:SetScript("OnClick", function()
+            lfbid_openTmogBid = this:GetChecked() and true or false
+            PersistLFBidSettings()
+        end)
+        if getglobal("LFBidOpenTMOGCheckButtonText") then
+            getglobal("LFBidOpenTMOGCheckButtonText"):SetText("TMOG")
         end
 
         lfbid_openFrame.closeBtn = CreateFrame("Button", nil, lfbid_openFrame, "UIPanelButtonTemplate")
@@ -2310,11 +2513,33 @@ local function OpenLFBidOpenWindow()
             if lfbid_openFrame.altCheck then
                 useAltTag = lfbid_openFrame.altCheck:GetChecked() and true or false
             end
+            local useTmogTag = false
+            if lfbid_openFrame.tmogCheck then
+                useTmogTag = lfbid_openFrame.tmogCheck:GetChecked() and true or false
+            end
+            if useAltTag and NormalizeSpec(spec) == "X" then
+                print("LFBid: ALT characters cannot bid X.")
+                return
+            end
             lfbid_openAltBid = useAltTag
+            lfbid_openTmogBid = useTmogTag
+            PersistLFBidSettings()
 
-            local msg = points .. " " .. spec
+            local trimmedPoints = tostring(points or "")
+            trimmedPoints = string.gsub(trimmedPoints, "^%s+", "")
+            trimmedPoints = string.gsub(trimmedPoints, "%s+$", "")
+
+            local msg
+            if useTmogTag and trimmedPoints == "" then
+                msg = "TMOG"
+            else
+                msg = trimmedPoints .. " " .. spec
+            end
             if useAltTag then
                 msg = msg .. " ALT"
+            end
+            if useTmogTag and string.lower(msg) ~= "tmog" and string.lower(msg) ~= "t-mog" then
+                msg = msg .. " TMOG"
             end
             local method, masterId = GetLootMethod()
             local lootMasterName
@@ -2336,7 +2561,9 @@ local function OpenLFBidOpenWindow()
                 return
             end
 
-            if points ~= "" then
+            if useTmogTag and trimmedPoints == "" then
+                print("LFBid: TMOG bid placed.")
+            elseif points ~= "" then
                 print("LFBid: " .. tostring(spec) .. " bid placed for " .. points .. " points.")
             else
                 print("LFBid: " .. tostring(spec) .. " bid placed.")
@@ -2361,6 +2588,9 @@ local function OpenLFBidOpenWindow()
 
     if lfbid_openFrame.altCheck then
         lfbid_openFrame.altCheck:SetChecked(lfbid_openAltBid and 1 or nil)
+    end
+    if lfbid_openFrame.tmogCheck then
+        lfbid_openFrame.tmogCheck:SetChecked(lfbid_openTmogBid and 1 or nil)
     end
     if lfbid_openFrame.itemText then
         if lfbid_openItemLink and lfbid_openItemLink ~= "" then
@@ -3154,8 +3384,8 @@ OpenLFBidWindow = function(itemLink, bidMode)
         LFbidFrame.alphaSlider:SetWidth(105)
         LFbidFrame.alphaSlider:SetHeight(14)
         LFbidFrame.alphaSlider:SetPoint("TOPLEFT", LFbidFrame, "TOPLEFT", 12, -16)
-        LFbidFrame.alphaSlider:SetMinMaxValues(0.05, 0.90)
-        LFbidFrame.alphaSlider:SetValueStep(0.05)
+        LFbidFrame.alphaSlider:SetMinMaxValues(0, 1)
+        LFbidFrame.alphaSlider:SetValueStep(0.01)
         LFbidFrame.alphaSlider:SetValue(lfbid_backdropAlpha)
         LFbidFrame.alphaSlider:SetScript("OnValueChanged", function()
             local value = arg1
@@ -3165,22 +3395,25 @@ OpenLFBidWindow = function(itemLink, bidMode)
             if value then
                 lfbid_backdropAlpha = value
                 ApplyLFBidBackdropAlpha()
+                PersistLFBidSettings()
             end
         end)
         if getglobal("LFBidMasterAlphaSliderText") then
             getglobal("LFBidMasterAlphaSliderText"):SetText("Background")
         end
         if getglobal("LFBidMasterAlphaSliderLow") then
-            getglobal("LFBidMasterAlphaSliderLow"):SetText("5%")
+            getglobal("LFBidMasterAlphaSliderLow"):SetText("")
+            getglobal("LFBidMasterAlphaSliderLow"):Hide()
         end
         if getglobal("LFBidMasterAlphaSliderHigh") then
-            getglobal("LFBidMasterAlphaSliderHigh"):SetText("90%")
+            getglobal("LFBidMasterAlphaSliderHigh"):SetText("")
+            getglobal("LFBidMasterAlphaSliderHigh"):Hide()
         end
 
         LFbidFrame.startBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
         LFbidFrame.startBtn:SetWidth(90)
         LFbidFrame.startBtn:SetHeight(24)
-        LFbidFrame.startBtn:SetPoint("TOP", LFbidFrame, "TOP", -48, -28)
+        LFbidFrame.startBtn:SetPoint("TOP", LFbidFrame, "TOP", -96, -36)
         LFbidFrame.startBtn:SetText("Start Bid")
         LFbidFrame.startBtn:SetScript("OnClick", function()
             StartPointsBiddingFromMasterWindow()
@@ -3190,19 +3423,29 @@ OpenLFBidWindow = function(itemLink, bidMode)
         LFbidFrame.stopBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
         LFbidFrame.stopBtn:SetWidth(90)
         LFbidFrame.stopBtn:SetHeight(24)
-        LFbidFrame.stopBtn:SetPoint("TOP", LFbidFrame, "TOP", 48, -28)
+        LFbidFrame.stopBtn:SetPoint("TOP", LFbidFrame, "TOP", 0, -36)
         LFbidFrame.stopBtn:SetText("Stop Bids")
             LFbidFrame.stopBtn:SetScript("OnClick", function()
                 CloseBidding()
             end)
 
+        LFbidFrame.cancelBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
+        LFbidFrame.cancelBtn:SetWidth(90)
+        LFbidFrame.cancelBtn:SetHeight(24)
+        LFbidFrame.cancelBtn:SetPoint("TOP", LFbidFrame, "TOP", 96, -36)
+        LFbidFrame.cancelBtn:SetText("Cancel Bid")
+        LFbidFrame.cancelBtn:SetScript("OnClick", function()
+            CancelBidding()
+        end)
+
         LFbidFrame.dkpCheckBox = CreateFrame("CheckButton", "LFBidUseDKPCheckBox", LFbidFrame, "UICheckButtonTemplate")
         LFbidFrame.dkpCheckBox:SetWidth(24)
         LFbidFrame.dkpCheckBox:SetHeight(24)
-        LFbidFrame.dkpCheckBox:SetPoint("TOPRIGHT", LFbidFrame, "TOPRIGHT", -28, -28)
+        LFbidFrame.dkpCheckBox:SetPoint("TOPRIGHT", LFbidFrame, "TOPRIGHT", -28, -16)
         LFbidFrame.dkpCheckBox:SetChecked(lfbid_useDKPCheck)
         LFbidFrame.dkpCheckBox:SetScript("OnClick", function()
             lfbid_useDKPCheck = this:GetChecked() and 1 or nil
+            PersistLFBidSettings()
             RefreshLFBidBidList()
         end)
         if getglobal("LFBidUseDKPCheckBoxText") then
@@ -3212,7 +3455,7 @@ OpenLFBidWindow = function(itemLink, bidMode)
         end
 
         LFbidFrame.mlBidLabel = LFbidFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        LFbidFrame.mlBidLabel:SetPoint("TOP", LFbidFrame, "TOP", -78, -60)
+        LFbidFrame.mlBidLabel:SetPoint("TOP", LFbidFrame, "TOP", -78, -70)
         LFbidFrame.mlBidLabel:SetText("ML Bid")
 
         LFbidFrame.mlBidPointsEdit = CreateFrame("EditBox", nil, LFbidFrame, "InputBoxTemplate")
@@ -3550,17 +3793,52 @@ if not lfbid_whisperFrame then
             end
         end
 
-        local finalName, points, spec, altBid = ParseBidMessage(msg, sender)
-        
-        if finalName and points ~= nil and spec then
+        local finalName, points, spec, altBid, tmogBid = ParseBidMessage(msg, sender)
+
+        if finalName then
+            local insertedBid = false
+            local normalizedSpec = NormalizeSpec(spec)
+            if altBid and normalizedSpec == "X" then
+                if IsPlayerMasterLooter() then
+                    print("LFBid: Ignored X bid from alt-tagged bidder " .. tostring(finalName) .. ".")
+                end
+                return
+            end
+
             RemoveExistingBidForPlayer(finalName)
-            table.insert(lfbid_bids, {
-                name = finalName,
-                points = points,
-                spec = spec,
-                altBid = altBid and true or false,
-                whisperBid = evt == "CHAT_MSG_WHISPER",
-            })
+
+            if points ~= nil and spec and spec ~= "" and normalizedSpec ~= "T-MOG" then
+                table.insert(lfbid_bids, {
+                    name = finalName,
+                    points = points,
+                    spec = spec,
+                    altBid = altBid and true or false,
+                    whisperBid = evt == "CHAT_MSG_WHISPER",
+                })
+                insertedBid = true
+            elseif points ~= nil and spec and spec ~= "" and normalizedSpec == "T-MOG" then
+                tmogBid = true
+            end
+
+            if tmogBid then
+                table.insert(lfbid_bids, {
+                    name = finalName,
+                    points = GenerateRandomTmogRoll(),
+                    spec = "T-MOG",
+                    altBid = altBid and true or false,
+                    whisperBid = evt == "CHAT_MSG_WHISPER",
+                })
+                insertedBid = true
+            end
+
+            if not insertedBid then
+                local amML = IsPlayerMasterLooter()
+                if amML then
+                    print("LFBid: Failed to parse " .. sourceType .. " bid from " .. (sender or "unknown") .. ": " .. (msg or "no message"))
+                end
+                return
+            end
+
             if lfbid_windowOpen then
                 RefreshLFBidBidList()
             end
@@ -4689,9 +4967,25 @@ RegisterLFBidMasterLootDropdownHook()
 RegisterLFBidToggleDropDownProbeHook()
 
 local lfbid_initFrame = CreateFrame("Frame")
+lfbid_initFrame:RegisterEvent("VARIABLES_LOADED")
 lfbid_initFrame:RegisterEvent("PLAYER_LOGIN")
+lfbid_initFrame:RegisterEvent("PLAYER_LOGOUT")
 lfbid_initFrame:RegisterEvent("LOOT_OPENED")
 lfbid_initFrame:SetScript("OnEvent", function()
+    if event == "VARIABLES_LOADED" then
+        LoadLFBidSettings()
+        ApplyLFBidBackdropAlpha()
+        if lfbid_optionsFrame then
+            SetDKPCheckTier(lfbid_dkpCheckTier)
+        end
+        return
+    end
+
+    if event == "PLAYER_LOGOUT" then
+        PersistLFBidSettings()
+        return
+    end
+
     RegisterLFBidSlashCommand()
     RegisterLFBidItemRefHook()
     RegisterLFBidLootWindowHook()
