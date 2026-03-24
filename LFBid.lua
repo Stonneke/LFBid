@@ -10,6 +10,16 @@ local lfbid_optionsFrame
 local lfbid_optionsWindowOpen = false
 local lfbid_dkpSheetFrame
 local lfbid_dkpSheetWindowOpen = false
+local lfbid_addonStatusFrame
+local lfbid_addonStatusWindowOpen = false
+local lfbid_addonStatusScanFrame
+local lfbid_addonStatusScanActive = false
+local lfbid_addonStatusScanToken = nil
+local lfbid_addonStatusExpected = {}
+local lfbid_addonStatusInstalled = {}
+local lfbid_addonStatusMissing = {}
+local lfbid_addonStatusDisplayInstalled = {}
+local lfbid_addonStatusDisplayMissing = {}
 local lfbid_dkpSheetScrollOffset = 0
 local lfbid_openType = "MS"
 local lfbid_mlBidType = "MS"
@@ -38,6 +48,9 @@ local lfbid_pendingWinnerAnnouncement = nil
 local lfbid_manualWinnerSelectionActive = false
 local lfbid_pendingManualWinnerBid = nil
 local lfbid_manualWinnerCostText = ""
+local LFBID_STATUS_REQUEST_PREFIX = "STATUSREQ:"
+local LFBID_STATUS_RESPONSE_PREFIX = "STATUSRES:"
+local LFBID_VERSION = "2.06"
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
@@ -56,6 +69,9 @@ local function ApplyLFBidBackdropAlpha()
     end
     if lfbid_dkpSheetFrame then
         lfbid_dkpSheetFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+    end
+    if lfbid_addonStatusFrame then
+        lfbid_addonStatusFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
     end
 end
 
@@ -203,6 +219,179 @@ local function DecodeAddonText(text)
     decoded = string.gsub(decoded, "%%7C", "|")
     decoded = string.gsub(decoded, "%%25", "%%")
     return decoded
+end
+
+local function GetLFBidVersionText()
+    return LFBID_VERSION
+end
+
+local function BuildLFBidStatusRequest(token)
+    return LFBID_STATUS_REQUEST_PREFIX .. tostring(token or "")
+end
+
+local function BuildLFBidStatusResponse(token, versionText)
+    return LFBID_STATUS_RESPONSE_PREFIX .. tostring(token or "") .. ":" .. EncodeAddonText(versionText)
+end
+
+local function ParseLFBidStatusRequest(msg)
+    local text = tostring(msg or "")
+    if string.sub(text, 1, string.len(LFBID_STATUS_REQUEST_PREFIX)) ~= LFBID_STATUS_REQUEST_PREFIX then
+        return nil
+    end
+
+    local token = string.sub(text, string.len(LFBID_STATUS_REQUEST_PREFIX) + 1)
+    if token == "" then
+        return nil
+    end
+
+    return token
+end
+
+local function ParseLFBidStatusResponse(msg)
+    local text = tostring(msg or "")
+    if string.sub(text, 1, string.len(LFBID_STATUS_RESPONSE_PREFIX)) ~= LFBID_STATUS_RESPONSE_PREFIX then
+        return nil, nil
+    end
+
+    local payload = string.sub(text, string.len(LFBID_STATUS_RESPONSE_PREFIX) + 1)
+    local _, _, token, versionText = string.find(payload, "^([^:]+):(.*)$")
+    if not token or token == "" then
+        return nil, nil
+    end
+
+    return token, DecodeAddonText(versionText)
+end
+
+local function GetSortedLFBidStatusNames(nameMap)
+    local names = {}
+    local normalizedName
+    for normalizedName in pairs(nameMap or {}) do
+        table.insert(names, normalizedName)
+    end
+
+    table.sort(names, function(a, b)
+        local left = tostring((nameMap[a] and nameMap[a].displayName) or a or "")
+        local right = tostring((nameMap[b] and nameMap[b].displayName) or b or "")
+        return string.lower(left) < string.lower(right)
+    end)
+
+    return names
+end
+
+local function FinalizeLFBidAddonStatusScan()
+    lfbid_addonStatusScanActive = false
+
+    local missing = {}
+    local normalizedName
+    for normalizedName, entry in pairs(lfbid_addonStatusExpected) do
+        if not lfbid_addonStatusInstalled[normalizedName] then
+            missing[normalizedName] = {
+                displayName = tostring(entry.displayName or normalizedName),
+            }
+        end
+    end
+
+    lfbid_addonStatusMissing = missing
+    lfbid_addonStatusDisplayInstalled = GetSortedLFBidStatusNames(lfbid_addonStatusInstalled)
+    lfbid_addonStatusDisplayMissing = GetSortedLFBidStatusNames(lfbid_addonStatusMissing)
+
+    if lfbid_addonStatusFrame and lfbid_addonStatusFrame.RefreshLists then
+        lfbid_addonStatusFrame:RefreshLists()
+    end
+end
+
+local function StopLFBidAddonStatusScanTimer()
+    if not lfbid_addonStatusScanFrame then
+        return
+    end
+
+    lfbid_addonStatusScanFrame:SetScript("OnUpdate", nil)
+    lfbid_addonStatusScanFrame:Hide()
+end
+
+local function StartLFBidAddonStatusScanTimer(durationSeconds)
+    if not lfbid_addonStatusScanFrame then
+        lfbid_addonStatusScanFrame = CreateFrame("Frame")
+    end
+
+    lfbid_addonStatusScanFrame.elapsed = 0
+    lfbid_addonStatusScanFrame.duration = tonumber(durationSeconds) or 2
+    lfbid_addonStatusScanFrame:SetScript("OnUpdate", function()
+        local elapsed = arg1 or 0
+        lfbid_addonStatusScanFrame.elapsed = (lfbid_addonStatusScanFrame.elapsed or 0) + elapsed
+        if lfbid_addonStatusScanFrame.elapsed < (lfbid_addonStatusScanFrame.duration or 2) then
+            return
+        end
+
+        StopLFBidAddonStatusScanTimer()
+        FinalizeLFBidAddonStatusScan()
+    end)
+    lfbid_addonStatusScanFrame:Show()
+end
+
+local function CollectCurrentRaidMembers()
+    local roster = {}
+    if not GetNumRaidMembers or not GetRaidRosterInfo then
+        return roster
+    end
+
+    local raidCount = tonumber(GetNumRaidMembers()) or 0
+    local raidIndex
+    for raidIndex = 1, raidCount do
+        local playerName = GetRaidRosterInfo(raidIndex)
+        local normalizedName = NormalizeBidderName(playerName)
+        if normalizedName ~= "" then
+            roster[normalizedName] = {
+                displayName = normalizedName,
+            }
+        end
+    end
+
+    return roster
+end
+
+local function StartLFBidAddonStatusScan()
+    lfbid_addonStatusExpected = {}
+    lfbid_addonStatusInstalled = {}
+    lfbid_addonStatusMissing = {}
+    lfbid_addonStatusDisplayInstalled = {}
+    lfbid_addonStatusDisplayMissing = {}
+
+    if not SendAddonMessage then
+        print("LFBid: Addon status scan requires SendAddonMessage.")
+        if lfbid_addonStatusFrame and lfbid_addonStatusFrame.RefreshLists then
+            lfbid_addonStatusFrame:RefreshLists()
+        end
+        return false
+    end
+
+    if not GetNumRaidMembers or (tonumber(GetNumRaidMembers()) or 0) <= 0 then
+        print("LFBid: You must be in a raid to check addon status.")
+        if lfbid_addonStatusFrame and lfbid_addonStatusFrame.RefreshLists then
+            lfbid_addonStatusFrame:RefreshLists()
+        end
+        return false
+    end
+
+    lfbid_addonStatusExpected = CollectCurrentRaidMembers()
+    lfbid_addonStatusScanToken = tostring(math.floor((GetTime and GetTime() or 0) * 1000)) .. tostring(math.random(1000, 9999))
+    lfbid_addonStatusScanActive = true
+
+    local myName = NormalizeBidderName(UnitName("player"))
+    if myName ~= "" and lfbid_addonStatusExpected[myName] then
+        lfbid_addonStatusInstalled[myName] = {
+            displayName = myName,
+            version = GetLFBidVersionText(),
+        }
+    end
+
+    if lfbid_addonStatusFrame and lfbid_addonStatusFrame.RefreshLists then
+        lfbid_addonStatusFrame:RefreshLists()
+    end
+
+    SendAddonMessage(LFBID_ADDON_PREFIX, BuildLFBidStatusRequest(lfbid_addonStatusScanToken), "RAID")
+    StartLFBidAddonStatusScanTimer(2)
+    return true
 end
 
 local function ItemTextForAnnouncement(itemText)
@@ -673,6 +862,14 @@ local function RemoveExistingBidForPlayer(playerName)
             table.remove(lfbid_bids, index)
         end
     end
+end
+
+local function GetBidDisplayName(bid)
+    local displayName = tostring(bid and bid.name or "")
+    if bid and bid.whisperBid then
+        displayName = displayName .. " *"
+    end
+    return displayName
 end
 
 local function StartLFBidMessageTimer(messages, intervalOrIntervals, onDone)
@@ -1661,7 +1858,7 @@ RefreshLFBidBidList = function()
             local bid = bidList[idx]
             if bid then
                 local pointsText = tostring(bid.points or "")
-                local nameText = tostring(bid.name or "")
+                local nameText = GetBidDisplayName(bid)
                 if IsUnknownZeroBid(bid) then
                     nameText = "|cff33aaff" .. nameText .. "|r"
                 elseif not BidHasEnoughDKP(bid) then
@@ -2694,11 +2891,141 @@ local function OpenLFBidDKPSheetWindow()
     lfbid_dkpSheetFrame:Show()
 end
 
+local function OpenLFBidAddonStatusWindow()
+    if not lfbid_addonStatusFrame then
+        lfbid_addonStatusFrame = CreateFrame("Frame", "LFBidAddonStatusFrame", UIParent)
+        lfbid_addonStatusFrame:SetWidth(380)
+        lfbid_addonStatusFrame:SetHeight(360)
+        lfbid_addonStatusFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
+        lfbid_addonStatusFrame:SetFrameStrata("DIALOG")
+        lfbid_addonStatusFrame:SetBackdrop({
+            bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+            tile = true, tileSize = 16, edgeSize = 16,
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
+        })
+        lfbid_addonStatusFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+        lfbid_addonStatusFrame:EnableMouse(true)
+        lfbid_addonStatusFrame:SetMovable(true)
+        lfbid_addonStatusFrame:RegisterForDrag("LeftButton")
+        lfbid_addonStatusFrame:SetScript("OnDragStart", function()
+            lfbid_addonStatusFrame:StartMoving()
+        end)
+        lfbid_addonStatusFrame:SetScript("OnDragStop", function()
+            lfbid_addonStatusFrame:StopMovingOrSizing()
+        end)
+
+        lfbid_addonStatusFrame.title = lfbid_addonStatusFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_addonStatusFrame.title:SetPoint("TOPLEFT", lfbid_addonStatusFrame, "TOPLEFT", 10, -14)
+        lfbid_addonStatusFrame.title:SetText("LFBid Addon Status")
+
+        lfbid_addonStatusFrame.closeBtn = CreateFrame("Button", nil, lfbid_addonStatusFrame, "UIPanelButtonTemplate")
+        lfbid_addonStatusFrame.closeBtn:SetWidth(24)
+        lfbid_addonStatusFrame.closeBtn:SetHeight(24)
+        lfbid_addonStatusFrame.closeBtn:SetPoint("TOPRIGHT", lfbid_addonStatusFrame, "TOPRIGHT", -4, -4)
+        lfbid_addonStatusFrame.closeBtn:SetText("X")
+        lfbid_addonStatusFrame.closeBtn:SetScript("OnClick", function()
+            lfbid_addonStatusFrame:Hide()
+            lfbid_addonStatusWindowOpen = false
+        end)
+
+        lfbid_addonStatusFrame.refreshBtn = CreateFrame("Button", nil, lfbid_addonStatusFrame, "UIPanelButtonTemplate")
+        lfbid_addonStatusFrame.refreshBtn:SetWidth(110)
+        lfbid_addonStatusFrame.refreshBtn:SetHeight(24)
+        lfbid_addonStatusFrame.refreshBtn:SetPoint("TOPRIGHT", lfbid_addonStatusFrame.closeBtn, "TOPLEFT", -8, 0)
+        lfbid_addonStatusFrame.refreshBtn:SetText("Refresh")
+        lfbid_addonStatusFrame.refreshBtn:SetScript("OnClick", function()
+            StartLFBidAddonStatusScan()
+        end)
+
+        lfbid_addonStatusFrame.statusText = lfbid_addonStatusFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        lfbid_addonStatusFrame.statusText:SetPoint("TOPLEFT", lfbid_addonStatusFrame.title, "BOTTOMLEFT", 0, -10)
+        lfbid_addonStatusFrame.statusText:SetWidth(350)
+        lfbid_addonStatusFrame.statusText:SetJustifyH("LEFT")
+
+        lfbid_addonStatusFrame.installedHeader = lfbid_addonStatusFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_addonStatusFrame.installedHeader:SetPoint("TOPLEFT", lfbid_addonStatusFrame.statusText, "BOTTOMLEFT", 0, -12)
+        lfbid_addonStatusFrame.installedHeader:SetText("Installed")
+
+        lfbid_addonStatusFrame.missingHeader = lfbid_addonStatusFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lfbid_addonStatusFrame.missingHeader:SetPoint("TOPLEFT", lfbid_addonStatusFrame.installedHeader, "TOPLEFT", 180, 0)
+        lfbid_addonStatusFrame.missingHeader:SetText("NOT Installed")
+
+        lfbid_addonStatusFrame.installedText = lfbid_addonStatusFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        lfbid_addonStatusFrame.installedText:SetPoint("TOPLEFT", lfbid_addonStatusFrame.installedHeader, "BOTTOMLEFT", 0, -6)
+        lfbid_addonStatusFrame.installedText:SetWidth(165)
+        lfbid_addonStatusFrame.installedText:SetJustifyH("LEFT")
+        lfbid_addonStatusFrame.installedText:SetJustifyV("TOP")
+
+        lfbid_addonStatusFrame.missingText = lfbid_addonStatusFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        lfbid_addonStatusFrame.missingText:SetPoint("TOPLEFT", lfbid_addonStatusFrame.missingHeader, "BOTTOMLEFT", 0, -6)
+        lfbid_addonStatusFrame.missingText:SetWidth(165)
+        lfbid_addonStatusFrame.missingText:SetJustifyH("LEFT")
+        lfbid_addonStatusFrame.missingText:SetJustifyV("TOP")
+
+        lfbid_addonStatusFrame.RefreshLists = function()
+            local installedLines = {}
+            local missingLines = {}
+            local _, normalizedName
+
+            if lfbid_addonStatusScanActive then
+                lfbid_addonStatusFrame.statusText:SetText("Scanning raid for LFBid responses...")
+            else
+                local expectedCount = table.getn(GetSortedLFBidStatusNames(lfbid_addonStatusExpected))
+                local installedCount = table.getn(lfbid_addonStatusDisplayInstalled or {})
+                local missingCount = table.getn(lfbid_addonStatusDisplayMissing or {})
+                lfbid_addonStatusFrame.statusText:SetText("Installed: " .. tostring(installedCount) .. " / " .. tostring(expectedCount) .. "  |  Missing: " .. tostring(missingCount))
+            end
+
+            for _, normalizedName in ipairs(lfbid_addonStatusDisplayInstalled or {}) do
+                local entry = lfbid_addonStatusInstalled[normalizedName]
+                local line = tostring((entry and entry.displayName) or normalizedName or "")
+                local versionText = tostring((entry and entry.version) or "")
+                if versionText ~= "" then
+                    line = line .. " (v" .. versionText .. ")"
+                end
+                table.insert(installedLines, line)
+            end
+
+            for _, normalizedName in ipairs(lfbid_addonStatusDisplayMissing or {}) do
+                local entry = lfbid_addonStatusMissing[normalizedName]
+                table.insert(missingLines, tostring((entry and entry.displayName) or normalizedName or ""))
+            end
+
+            if table.getn(installedLines) == 0 then
+                if lfbid_addonStatusScanActive then
+                    installedLines[1] = "Waiting for replies..."
+                else
+                    installedLines[1] = "-"
+                end
+            end
+
+            if table.getn(missingLines) == 0 then
+                if lfbid_addonStatusScanActive then
+                    missingLines[1] = "Waiting for scan..."
+                else
+                    missingLines[1] = "-"
+                end
+            end
+
+            lfbid_addonStatusFrame.installedText:SetText(table.concat(installedLines, "\n"))
+            lfbid_addonStatusFrame.missingText:SetText(table.concat(missingLines, "\n"))
+        end
+    end
+
+    lfbid_addonStatusFrame:SetBackdropColor(0, 0, 0, lfbid_backdropAlpha)
+    lfbid_addonStatusWindowOpen = true
+    lfbid_addonStatusFrame:Show()
+    if lfbid_addonStatusFrame.RefreshLists then
+        lfbid_addonStatusFrame:RefreshLists()
+    end
+end
+
 local function OpenLFBidOptionsWindow()
     if not lfbid_optionsFrame then
         lfbid_optionsFrame = CreateFrame("Frame", "LFBidOptionsFrame", UIParent)
         lfbid_optionsFrame:SetWidth(260)
-        lfbid_optionsFrame:SetHeight(260)
+        lfbid_optionsFrame:SetHeight(300)
         lfbid_optionsFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 100)
         lfbid_optionsFrame:SetFrameStrata("DIALOG")
         lfbid_optionsFrame:SetBackdrop({
@@ -2759,8 +3086,18 @@ local function OpenLFBidOptionsWindow()
             OpenLFBidDKPSheetWindow()
         end)
 
+        lfbid_optionsFrame.addonStatusBtn = CreateFrame("Button", nil, lfbid_optionsFrame, "UIPanelButtonTemplate")
+        lfbid_optionsFrame.addonStatusBtn:SetWidth(200)
+        lfbid_optionsFrame.addonStatusBtn:SetHeight(26)
+        lfbid_optionsFrame.addonStatusBtn:SetPoint("TOP", lfbid_optionsFrame.showDKPSheetBtn, "BOTTOM", 0, -10)
+        lfbid_optionsFrame.addonStatusBtn:SetText("Who has addon")
+        lfbid_optionsFrame.addonStatusBtn:SetScript("OnClick", function()
+            OpenLFBidAddonStatusWindow()
+            StartLFBidAddonStatusScan()
+        end)
+
         lfbid_optionsFrame.raidTierLabel = lfbid_optionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        lfbid_optionsFrame.raidTierLabel:SetPoint("TOPLEFT", lfbid_optionsFrame.showDKPSheetBtn, "BOTTOMLEFT", 0, -14)
+        lfbid_optionsFrame.raidTierLabel:SetPoint("TOPLEFT", lfbid_optionsFrame.addonStatusBtn, "BOTTOMLEFT", 0, -14)
         lfbid_optionsFrame.raidTierLabel:SetText("Bid DKP Tier")
 
         lfbid_optionsFrame.t1RaidCheck = CreateFrame("CheckButton", "LFBidT1RaidCheckButton", lfbid_optionsFrame, "UICheckButtonTemplate")
@@ -3196,6 +3533,15 @@ if not lfbid_whisperFrame then
         if sourceType == "addon" and IsClosePayload(msg) then
             return
         end
+        if sourceType == "addon" and ParseLFBidStatusRequest(msg) then
+            return
+        end
+        if sourceType == "addon" then
+            local statusToken = ParseLFBidStatusResponse(msg)
+            if statusToken then
+                return
+            end
+        end
         if sourceType == "addon" then
             local addonChannel = p3 or arg3
             local dkpPlayer = ParseDKPDeltaMessage(msg)
@@ -3213,6 +3559,7 @@ if not lfbid_whisperFrame then
                 points = points,
                 spec = spec,
                 altBid = altBid and true or false,
+                whisperBid = evt == "CHAT_MSG_WHISPER",
             })
             if lfbid_windowOpen then
                 RefreshLFBidBidList()
@@ -3267,13 +3614,40 @@ lfbid_openSyncFrame:SetScript("OnEvent", function(_, eventName, p1, p2, p3, p4)
         return
     end
 
+    local myName = NormalizeBidderName(UnitName("player"))
+    local senderName = NormalizeBidderName(sender)
+
+    local statusRequestToken = ParseLFBidStatusRequest(msg)
+    if statusRequestToken then
+        if channel == "RAID" and senderName ~= "" and myName ~= "" and string.lower(senderName) ~= string.lower(myName) then
+            SendAddonMessage(LFBID_ADDON_PREFIX, BuildLFBidStatusResponse(statusRequestToken, GetLFBidVersionText()), "RAID")
+        end
+        return
+    end
+
+    local statusResponseToken, statusVersion = ParseLFBidStatusResponse(msg)
+    if statusResponseToken then
+        if lfbid_addonStatusScanActive and lfbid_addonStatusScanToken and statusResponseToken == lfbid_addonStatusScanToken then
+            if senderName ~= "" and lfbid_addonStatusExpected[senderName] then
+                lfbid_addonStatusInstalled[senderName] = {
+                    displayName = tostring(lfbid_addonStatusExpected[senderName].displayName or senderName),
+                    version = tostring(statusVersion or "unknown"),
+                }
+                lfbid_addonStatusDisplayInstalled = GetSortedLFBidStatusNames(lfbid_addonStatusInstalled)
+                if lfbid_addonStatusFrame and lfbid_addonStatusFrame.RefreshLists then
+                    lfbid_addonStatusFrame:RefreshLists()
+                end
+            end
+        end
+        return
+    end
+
     local startItemLink = ExtractStartPayload(msg)
     local isClose = IsClosePayload(msg)
     if startItemLink == nil and not isClose then
         return
     end
 
-    local myName = UnitName("player")
     if sender and myName and string.lower(sender) == string.lower(myName) then
         return
     end
