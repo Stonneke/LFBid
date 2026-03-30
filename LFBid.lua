@@ -23,6 +23,8 @@ local lfbid_addonStatusDisplayMissing = {}
 local lfbid_dkpSheetScrollOffset = 0
 local lfbid_openType = "MS"
 local lfbid_mlBidType = "MS"
+local lfbid_mlAltBid = false
+local lfbid_mlTmogBid = false
 local lfbid_openItemLink = ""
 local lfbid_biddingOpen = false
 local lfbid_bidMode = "points"
@@ -51,7 +53,7 @@ local lfbid_pendingManualWinnerBid = nil
 local lfbid_manualWinnerCostText = ""
 local LFBID_STATUS_REQUEST_PREFIX = "STATUSREQ:"
 local LFBID_STATUS_RESPONSE_PREFIX = "STATUSRES:"
-local LFBID_VERSION = "2.11"
+local LFBID_VERSION = "2.12"
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
@@ -730,6 +732,11 @@ local function NormalizeSpec(spec)
     return string.upper(first) .. string.lower(rest)
 end
 
+local function IsSupportedBidSpec(spec)
+    local normalized = NormalizeSpec(spec)
+    return normalized == "MS" or normalized == "OS" or normalized == "T-MOG" or normalized == "X"
+end
+
 local function HasPrimaryMSBids()
     for _, bid in ipairs(lfbid_bids) do
         if bid and NormalizeSpec(bid.spec) == "MS" then
@@ -1042,17 +1049,40 @@ local function ResolvePointsAuctionOutcome()
                 points = points,
                 spec = spec,
                 originalSpec = originalSpec,
+                altBid = bid and bid.altBid and true or false,
             })
         end
     end
 
     local selectedSpec = nil
     local selectedBids = nil
+
+    -- ALT bids are fallback-only: if any non-ALT bids exist in a higher-priority
+    -- bucket, that bucket must win selection and ALT bids cannot beat those players.
     for _, spec in ipairs(priority) do
-        if table.getn(buckets[spec]) > 0 then
+        local bucket = buckets[spec]
+        local hasNonAlt = false
+        for _, entry in ipairs(bucket) do
+            if not entry.altBid then
+                hasNonAlt = true
+                break
+            end
+        end
+
+        if hasNonAlt then
             selectedSpec = spec
-            selectedBids = buckets[spec]
+            selectedBids = bucket
             break
+        end
+    end
+
+    if not selectedSpec then
+        for _, spec in ipairs(priority) do
+            if table.getn(buckets[spec]) > 0 then
+                selectedSpec = spec
+                selectedBids = buckets[spec]
+                break
+            end
         end
     end
 
@@ -1060,16 +1090,33 @@ local function ResolvePointsAuctionOutcome()
         return nil
     end
 
-    table.sort(selectedBids, function(a, b)
+    local winnerPool = selectedBids
+    local nonAltPool = {}
+    for _, entry in ipairs(selectedBids) do
+        if not entry.altBid then
+            table.insert(nonAltPool, entry)
+        end
+    end
+    if table.getn(nonAltPool) > 0 then
+        winnerPool = nonAltPool
+    end
+
+    table.sort(winnerPool, function(a, b)
         if a.points ~= b.points then
             return a.points > b.points
         end
         return string.lower(tostring(a.name or "")) < string.lower(tostring(b.name or ""))
     end)
 
-    local winner = selectedBids[1]
+    local winner = winnerPool[1]
     if not winner or winner.name == "" then
         return nil
+    end
+
+    -- For DKP pricing, ALT bids must never influence a non-ALT winner's cost.
+    local pricingPool = winnerPool
+    if not winner.altBid and table.getn(nonAltPool) > 0 then
+        pricingPool = nonAltPool
     end
 
     local cost = 1
@@ -1078,7 +1125,7 @@ local function ResolvePointsAuctionOutcome()
     local tiedTop = {}
     local tieIncludesX = false
     local _, bidEntry
-    for _, bidEntry in ipairs(selectedBids) do
+    for _, bidEntry in ipairs(pricingPool) do
         local bidPoints = tonumber(bidEntry and bidEntry.points) or 0
         if bidPoints == winnerBid then
             table.insert(tiedTop, tostring(bidEntry.name or ""))
@@ -1107,8 +1154,8 @@ local function ResolvePointsAuctionOutcome()
     end
 
     local winnerIsX = NormalizeSpec(winner.originalSpec) == "X"
-    if table.getn(selectedBids) >= 2 then
-        local secondBid = tonumber(selectedBids[2].points) or 0
+    if table.getn(pricingPool) >= 2 then
+        local secondBid = tonumber(pricingPool[2].points) or 0
 
         if winnerIsX then
             cost = (secondBid + 1) * 2
@@ -1529,6 +1576,10 @@ local function StartPointsBiddingFromMasterWindow()
 
     local mlOpeningBidPoints = nil
     local mlOpeningBidSpec = NormalizeSpec(lfbid_mlBidType)
+    local mlOpeningBidAlt = lfbid_mlAltBid and true or false
+    local shouldInsertPrimaryBid = false
+    local shouldInsertTmogBid = lfbid_mlTmogBid and true or false
+    local shouldInsertMLOpeningBid = false
     if LFbidFrame and LFbidFrame.mlBidPointsEdit then
         local text = tostring(LFbidFrame.mlBidPointsEdit:GetText() or "")
         text = string.gsub(text, "^%s+", "")
@@ -1549,6 +1600,17 @@ local function StartPointsBiddingFromMasterWindow()
     end
 
     if mlOpeningBidPoints ~= nil then
+        shouldInsertPrimaryBid = true
+    end
+
+    if shouldInsertPrimaryBid and mlOpeningBidAlt and mlOpeningBidSpec == "X" then
+        print("LFBid: ALT characters cannot bid X.")
+        shouldInsertPrimaryBid = false
+    end
+
+    shouldInsertMLOpeningBid = shouldInsertPrimaryBid or shouldInsertTmogBid
+
+    if shouldInsertMLOpeningBid then
         local myName = string.lower(tostring(UnitName("player") or ""))
         local hasOtherBids = false
         for _, bid in ipairs(lfbid_bids) do
@@ -1561,7 +1623,7 @@ local function StartPointsBiddingFromMasterWindow()
 
         if hasOtherBids then
             print("LFBid: ML opening bid is only allowed before other bids come in.")
-            mlOpeningBidPoints = nil
+            shouldInsertMLOpeningBid = false
         end
     end
 
@@ -1570,15 +1632,28 @@ local function StartPointsBiddingFromMasterWindow()
     lfbid_manualWinnerSelectionActive = false
     lfbid_pendingManualWinnerBid = nil
 
-    if mlOpeningBidPoints ~= nil then
+    if shouldInsertMLOpeningBid then
         local myName = tostring(UnitName("player") or "")
         if myName ~= "" then
             RemoveExistingBidForPlayer(myName)
-            table.insert(lfbid_bids, {
-                name = myName,
-                points = mlOpeningBidPoints,
-                spec = mlOpeningBidSpec,
-            })
+
+            if shouldInsertPrimaryBid then
+                table.insert(lfbid_bids, {
+                    name = myName,
+                    points = mlOpeningBidPoints,
+                    spec = mlOpeningBidSpec,
+                    altBid = mlOpeningBidAlt,
+                })
+            end
+
+            if shouldInsertTmogBid then
+                table.insert(lfbid_bids, {
+                    name = myName,
+                    points = GenerateRandomTmogRoll(),
+                    spec = "T-MOG",
+                    altBid = mlOpeningBidAlt,
+                })
+            end
         end
     end
 
@@ -1671,6 +1746,34 @@ RefreshMasterLootButtons = function()
             end
         else
             LFbidFrame.mlBidSpecDropDown:Hide()
+        end
+    end
+
+    if LFbidFrame.mlTmogCheck then
+        if lfbid_bidMode == "points" then
+            LFbidFrame.mlTmogCheck:Show()
+            LFbidFrame.mlTmogCheck:SetChecked(lfbid_mlTmogBid and 1 or nil)
+            if lfbid_biddingOpen then
+                LFbidFrame.mlTmogCheck:EnableMouse(false)
+            else
+                LFbidFrame.mlTmogCheck:EnableMouse(true)
+            end
+        else
+            LFbidFrame.mlTmogCheck:Hide()
+        end
+    end
+
+    if LFbidFrame.mlAltCheck then
+        if lfbid_bidMode == "points" then
+            LFbidFrame.mlAltCheck:Show()
+            LFbidFrame.mlAltCheck:SetChecked(lfbid_mlAltBid and 1 or nil)
+            if lfbid_biddingOpen then
+                LFbidFrame.mlAltCheck:EnableMouse(false)
+            else
+                LFbidFrame.mlAltCheck:EnableMouse(true)
+            end
+        else
+            LFbidFrame.mlAltCheck:Hide()
         end
     end
 end
@@ -1951,15 +2054,11 @@ RefreshLFBidBidList = function()
         LFbidFrame.bidScrollBar:Hide()
     end
 
-    local specs = {"MS", "OS"}
+    local specs = {"MS", "OS", "T-MOG"}
     local grouped = {
         MS = {},
         OS = {},
-    }
-    local extraSpecs = {}
-    local seen = {
-        MS = true,
-        OS = true,
+        ["T-MOG"] = {},
     }
 
     local hasPrimaryMSBids = HasPrimaryMSBids()
@@ -1967,24 +2066,10 @@ RefreshLFBidBidList = function()
     for _, bid in ipairs(lfbid_bids) do
         if bid then
             local normalized = GetEffectiveBidSpec(bid.spec, hasPrimaryMSBids)
-            if not grouped[normalized] then
-                grouped[normalized] = {}
-            end
-            table.insert(grouped[normalized], bid)
-
-            if not seen[normalized] then
-                seen[normalized] = true
-                table.insert(extraSpecs, normalized)
+            if grouped[normalized] then
+                table.insert(grouped[normalized], bid)
             end
         end
-    end
-
-    table.sort(extraSpecs, function(a, b)
-        return string.lower(a) < string.lower(b)
-    end)
-
-    for _, spec in ipairs(extraSpecs) do
-        table.insert(specs, spec)
     end
 
     for spec, bidList in pairs(grouped) do
@@ -3455,13 +3540,13 @@ OpenLFBidWindow = function(itemLink, bidMode)
         end
 
         LFbidFrame.mlBidLabel = LFbidFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        LFbidFrame.mlBidLabel:SetPoint("TOP", LFbidFrame, "TOP", -78, -70)
-        LFbidFrame.mlBidLabel:SetText("ML Bid")
+        LFbidFrame.mlBidLabel:SetPoint("TOP", LFbidFrame, "TOP", -150, -70)
+        LFbidFrame.mlBidLabel:SetText("ML Bid   ")
 
         LFbidFrame.mlBidPointsEdit = CreateFrame("EditBox", nil, LFbidFrame, "InputBoxTemplate")
         LFbidFrame.mlBidPointsEdit:SetWidth(58)
         LFbidFrame.mlBidPointsEdit:SetHeight(18)
-        LFbidFrame.mlBidPointsEdit:SetPoint("LEFT", LFbidFrame.mlBidLabel, "RIGHT", 8, 0)
+        LFbidFrame.mlBidPointsEdit:SetPoint("LEFT", LFbidFrame.mlBidLabel, "RIGHT", 6, 0)
         LFbidFrame.mlBidPointsEdit:SetAutoFocus(false)
 
         LFbidFrame.mlBidSpecDropDown = CreateFrame("Frame", "LFBidMasterMLBidSpecDropDown", LFbidFrame, "UIDropDownMenuTemplate")
@@ -3470,6 +3555,32 @@ OpenLFBidWindow = function(itemLink, bidMode)
         UIDropDownMenu_Initialize(LFbidFrame.mlBidSpecDropDown, LFBidMLBidDropDown_Initialize)
         UIDropDownMenu_SetSelectedValue(LFbidFrame.mlBidSpecDropDown, lfbid_mlBidType)
         UIDropDownMenu_SetText(lfbid_mlBidType, LFbidFrame.mlBidSpecDropDown)
+
+        LFbidFrame.mlAltCheck = CreateFrame("CheckButton", "LFBidMasterMLAltCheckButton", LFbidFrame, "UICheckButtonTemplate")
+        LFbidFrame.mlAltCheck:SetPoint("LEFT", LFbidFrame.mlBidSpecDropDown, "RIGHT", -12, 0)
+        LFbidFrame.mlAltCheck:SetWidth(24)
+        LFbidFrame.mlAltCheck:SetHeight(24)
+        LFbidFrame.mlAltCheck:SetChecked(lfbid_mlAltBid and 1 or nil)
+        LFbidFrame.mlAltCheck:SetScript("OnClick", function()
+            lfbid_mlAltBid = this:GetChecked() and true or false
+            RefreshMasterLootButtons()
+        end)
+        if getglobal("LFBidMasterMLAltCheckButtonText") then
+            getglobal("LFBidMasterMLAltCheckButtonText"):SetText("ALT  ")
+        end
+
+        LFbidFrame.mlTmogCheck = CreateFrame("CheckButton", "LFBidMasterMLTMOGCheckButton", LFbidFrame, "UICheckButtonTemplate")
+        LFbidFrame.mlTmogCheck:SetPoint("LEFT", LFbidFrame.mlAltCheck, "RIGHT", 16, 0)
+        LFbidFrame.mlTmogCheck:SetWidth(24)
+        LFbidFrame.mlTmogCheck:SetHeight(24)
+        LFbidFrame.mlTmogCheck:SetChecked(lfbid_mlTmogBid and 1 or nil)
+        LFbidFrame.mlTmogCheck:SetScript("OnClick", function()
+            lfbid_mlTmogBid = this:GetChecked() and true or false
+            RefreshMasterLootButtons()
+        end)
+        if getglobal("LFBidMasterMLTMOGCheckButtonText") then
+            getglobal("LFBidMasterMLTMOGCheckButtonText"):SetText("T-MOG")
+        end
 
         LFbidFrame.text = LFbidFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         if LFbidFrame.text then
@@ -3648,6 +3759,12 @@ OpenLFBidWindow = function(itemLink, bidMode)
         UIDropDownMenu_SetSelectedValue(LFbidFrame.mlBidSpecDropDown, lfbid_mlBidType)
         UIDropDownMenu_SetText(lfbid_mlBidType, LFbidFrame.mlBidSpecDropDown)
     end
+    if LFbidFrame.mlTmogCheck then
+        LFbidFrame.mlTmogCheck:SetChecked(lfbid_mlTmogBid and 1 or nil)
+    end
+    if LFbidFrame.mlAltCheck then
+        LFbidFrame.mlAltCheck:SetChecked(lfbid_mlAltBid and 1 or nil)
+    end
     lfbid_bidMode = bidMode or "points"
     lfbid_bids = {}
     lfbid_rollSeen = {}
@@ -3806,6 +3923,13 @@ if not lfbid_whisperFrame then
             end
 
             RemoveExistingBidForPlayer(finalName)
+
+            if points ~= nil and spec and spec ~= "" and not IsSupportedBidSpec(normalizedSpec) then
+                if IsPlayerMasterLooter() then
+                    print("LFBid: Ignored invalid spec from " .. tostring(finalName) .. ": " .. tostring(spec))
+                end
+                return
+            end
 
             if points ~= nil and spec and spec ~= "" and normalizedSpec ~= "T-MOG" then
                 table.insert(lfbid_bids, {
