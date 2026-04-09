@@ -53,7 +53,7 @@ local lfbid_pendingManualWinnerBid = nil
 local lfbid_manualWinnerCostText = ""
 local LFBID_STATUS_REQUEST_PREFIX = "STATUSREQ:"
 local LFBID_STATUS_RESPONSE_PREFIX = "STATUSRES:"
-local LFBID_VERSION = "2.12"
+local LFBID_VERSION = "2.13"
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
@@ -191,6 +191,21 @@ local function ParseBidMessage(msg, fallbackName)
     elseif token2Number and not token1Number then
         points = token2Number
         spec = token1
+    end
+
+    -- Also accept no-space formats: "<points><spec>" (e.g. "25MS") or "<spec><points>" (e.g. "MS25").
+    if not points and table.getn(tokens) == 1 then
+        local s, e, numPart, specPart = string.find(token1, "^(%d+)(%a+)$")
+        if numPart and specPart then
+            points = tonumber(numPart)
+            spec = specPart
+        else
+            local s2, e2, specPart2, numPart2 = string.find(token1, "^(%a+)(%d+)$")
+            if specPart2 and numPart2 then
+                points = tonumber(numPart2)
+                spec = specPart2
+            end
+        end
     end
 
     -- Allow transmog bids without points (e.g. "T-MOG" or "TMOG").
@@ -1521,6 +1536,92 @@ local function CloseBidding()
     end)
 end
 
+local function CloseBiddingNow()
+    if not lfbid_biddingOpen then
+        print("LFBid: Bidding is not active.")
+        return
+    end
+
+    -- Cancel any in-progress countdown timer.
+    if lfbid_timerFrame then
+        lfbid_timerFrame:Hide()
+    end
+
+    if lfbid_bidMode == "roll" then
+        local itemText = lfbid_activeItem or "item"
+        local winnerName = nil
+        local winnerRoll = nil
+        for _, bid in ipairs(lfbid_bids) do
+            local bidRoll = tonumber(bid and bid.points) or 0
+            local bidName = tostring(bid and bid.name or "")
+            if not winnerName or bidRoll > winnerRoll or (bidRoll == winnerRoll and string.lower(bidName) < string.lower(winnerName)) then
+                winnerName = bidName
+                winnerRoll = bidRoll
+            end
+        end
+        SendSafeChatMessage("Ending rolls for " .. itemText, "RAID_WARNING")
+        SendSafeChatMessage("Rolls have ended", "RAID_WARNING")
+        if winnerName and winnerName ~= "" and winnerRoll ~= nil then
+            SendSafeChatMessage("Winner: " .. winnerName .. " with " .. tostring(winnerRoll), "RAID_WARNING")
+        else
+            SendSafeChatMessage("Winner: No valid rolls", "RAID_WARNING")
+        end
+    else
+        if lfbid_activeItem then
+            SendSafeChatMessage("Closing bids on item " .. lfbid_activeItem, "RAID_WARNING")
+        end
+        SendSafeChatMessage("Bids are now closed", "RAID_WARNING")
+    end
+
+    local pointsOutcome = nil
+    if lfbid_bidMode == "points" then
+        pointsOutcome = ResolvePointsAuctionOutcome()
+    end
+
+    lfbid_biddingOpen = false
+    lfbid_rollSeen = {}
+    SendBiddingCloseMessage()
+    if RefreshMasterLootButtons then
+        RefreshMasterLootButtons()
+    end
+
+    if lfbid_bidMode == "points" then
+        if pointsOutcome then
+            if IsPlayerMasterLooter() then
+                EnsureWinnerConfirmPopupRegistered()
+                lfbid_pendingWinnerAnnouncement = pointsOutcome
+                local confirmText
+                if pointsOutcome.isTie and pointsOutcome.tieNames and table.getn(pointsOutcome.tieNames) >= 2 then
+                    if pointsOutcome.tieIncludesX then
+                        confirmText = "Tie: " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Announce roll-off?"
+                    else
+                        confirmText = "Tie: " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Announce roll-off for " .. tostring(pointsOutcome.cost) .. " DKP?"
+                    end
+                else
+                    confirmText = tostring(pointsOutcome.winnerName) .. " won for " .. tostring(pointsOutcome.cost) .. " DKP, announce?"
+                end
+                if StaticPopup_Show then
+                    StaticPopup_Show("LFBID_CONFIRM_WINNER_ANNOUNCE", confirmText)
+                else
+                    print("LFBid: " .. confirmText)
+                end
+            else
+                if pointsOutcome.isTie and pointsOutcome.tieNames and table.getn(pointsOutcome.tieNames) >= 2 then
+                    if pointsOutcome.tieIncludesX then
+                        print("LFBid: Tie between " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Roll-off required.")
+                    else
+                        print("LFBid: Tie between " .. table.concat(pointsOutcome.tieNames, ", ") .. ". Roll-off for " .. tostring(pointsOutcome.cost) .. " DKP.")
+                    end
+                else
+                    print("LFBid: Winner is " .. tostring(pointsOutcome.winnerName) .. " for " .. tostring(pointsOutcome.cost) .. " DKP.")
+                end
+            end
+        else
+            print("LFBid: Bidding ended with no valid MS/OS/T-MOG bids.")
+        end
+    end
+end
+
 local function CancelBidding()
     if not lfbid_biddingOpen then
         print("LFBid: Bidding is not active.")
@@ -1697,6 +1798,14 @@ RefreshMasterLootButtons = function()
             LFbidFrame.stopBtn:Enable()
         else
             LFbidFrame.stopBtn:Disable()
+        end
+    end
+
+    if LFbidFrame.stopNowBtn then
+        if lfbid_biddingOpen then
+            LFbidFrame.stopNowBtn:Enable()
+        else
+            LFbidFrame.stopNowBtn:Disable()
         end
     end
 
@@ -2511,15 +2620,14 @@ local function OpenLFBidOpenWindow()
         lfbid_openFrame.itemLinkButton:SetHeight(18)
         lfbid_openFrame.itemLinkButton:SetPoint("LEFT", lfbid_openFrame.itemText, "LEFT", 0, 0)
         lfbid_openFrame.itemLinkButton.itemLink = nil
-        local openItemButton = lfbid_openFrame.itemLinkButton
         lfbid_openFrame.itemLinkButton:SetScript("OnEnter", function()
-            ShowItemTooltip(openItemButton, openItemButton.itemLink)
+            ShowItemTooltip(this, this and this.itemLink or nil)
         end)
         lfbid_openFrame.itemLinkButton:SetScript("OnLeave", function()
             GameTooltip:Hide()
         end)
         lfbid_openFrame.itemLinkButton:SetScript("OnClick", function()
-            HandleItemLinkClick(openItemButton.itemLink)
+            HandleItemLinkClick(this and this.itemLink or nil)
         end)
 
         lfbid_openFrame.pointsEditBox = CreateFrame("EditBox", nil, lfbid_openFrame, "InputBoxTemplate")
@@ -3496,28 +3604,38 @@ OpenLFBidWindow = function(itemLink, bidMode)
         end
 
         LFbidFrame.startBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
-        LFbidFrame.startBtn:SetWidth(90)
+        LFbidFrame.startBtn:SetWidth(80)
         LFbidFrame.startBtn:SetHeight(24)
-        LFbidFrame.startBtn:SetPoint("TOP", LFbidFrame, "TOP", -96, -36)
+        LFbidFrame.startBtn:SetPoint("TOP", LFbidFrame, "TOP", -155, -36)
         LFbidFrame.startBtn:SetText("Start Bid")
         LFbidFrame.startBtn:SetScript("OnClick", function()
             StartPointsBiddingFromMasterWindow()
         end)
 
-        -- Stop Bids button (top center)
+        -- Stop Bids button
         LFbidFrame.stopBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
-        LFbidFrame.stopBtn:SetWidth(90)
+        LFbidFrame.stopBtn:SetWidth(80)
         LFbidFrame.stopBtn:SetHeight(24)
-        LFbidFrame.stopBtn:SetPoint("TOP", LFbidFrame, "TOP", 0, -36)
+        LFbidFrame.stopBtn:SetPoint("LEFT", LFbidFrame.startBtn, "RIGHT", 4, 0)
         LFbidFrame.stopBtn:SetText("Stop Bids")
-            LFbidFrame.stopBtn:SetScript("OnClick", function()
-                CloseBidding()
-            end)
+        LFbidFrame.stopBtn:SetScript("OnClick", function()
+            CloseBidding()
+        end)
+
+        -- Stop Bid NOW button (immediate, no countdown)
+        LFbidFrame.stopNowBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
+        LFbidFrame.stopNowBtn:SetWidth(112)
+        LFbidFrame.stopNowBtn:SetHeight(24)
+        LFbidFrame.stopNowBtn:SetPoint("LEFT", LFbidFrame.stopBtn, "RIGHT", 4, 0)
+        LFbidFrame.stopNowBtn:SetText("Stop Bid NOW")
+        LFbidFrame.stopNowBtn:SetScript("OnClick", function()
+            CloseBiddingNow()
+        end)
 
         LFbidFrame.cancelBtn = CreateFrame("Button", nil, LFbidFrame, "UIPanelButtonTemplate")
-        LFbidFrame.cancelBtn:SetWidth(90)
+        LFbidFrame.cancelBtn:SetWidth(80)
         LFbidFrame.cancelBtn:SetHeight(24)
-        LFbidFrame.cancelBtn:SetPoint("TOP", LFbidFrame, "TOP", 96, -36)
+        LFbidFrame.cancelBtn:SetPoint("LEFT", LFbidFrame.stopNowBtn, "RIGHT", 4, 0)
         LFbidFrame.cancelBtn:SetText("Cancel Bid")
         LFbidFrame.cancelBtn:SetScript("OnClick", function()
             CancelBidding()
@@ -3940,6 +4058,9 @@ if not lfbid_whisperFrame then
                     whisperBid = evt == "CHAT_MSG_WHISPER",
                 })
                 insertedBid = true
+                if sourceType == "addon" then
+                    print("LFBid bid: " .. tostring(finalName) .. " " .. tostring(points) .. " " .. tostring(spec))
+                end
             elseif points ~= nil and spec and spec ~= "" and normalizedSpec == "T-MOG" then
                 tmogBid = true
             end
@@ -3953,6 +4074,9 @@ if not lfbid_whisperFrame then
                     whisperBid = evt == "CHAT_MSG_WHISPER",
                 })
                 insertedBid = true
+                if sourceType == "addon" then
+                    print("LFBid bid: " .. tostring(finalName) .. " T-MOG")
+                end
             end
 
             if not insertedBid then
