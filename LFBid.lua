@@ -53,7 +53,7 @@ local lfbid_pendingManualWinnerBid = nil
 local lfbid_manualWinnerCostText = ""
 local LFBID_STATUS_REQUEST_PREFIX = "STATUSREQ:"
 local LFBID_STATUS_RESPONSE_PREFIX = "STATUSRES:"
-local LFBID_VERSION = "2.13"
+local LFBID_VERSION = "2.14"
 local RefreshMasterLootButtons
 local RefreshLFBidBidList
 local RefreshLFBidDKPSheetWindow
@@ -1245,6 +1245,182 @@ local function SendWinnerAnnouncement(outcome)
     print("LFBid: " .. message)
 end
 
+local function ExtractItemID(itemLink)
+    local text = tostring(itemLink or "")
+    if text == "" then
+        return nil
+    end
+
+    local itemString = ExtractItemString(text) or text
+    local _, _, itemIdText = string.find(itemString, "item:(%d+):")
+    if not itemIdText then
+        _, _, itemIdText = string.find(itemString, "item:(%d+)")
+    end
+    if not itemIdText then
+        return nil
+    end
+
+    return tonumber(itemIdText)
+end
+
+local function NormalizeAnnouncementItemText(itemLink)
+    local text = string.lower(tostring(ItemTextForAnnouncement(itemLink) or ""))
+    text = string.gsub(text, "^%s+", "")
+    text = string.gsub(text, "%s+$", "")
+    return text
+end
+
+local function FindLootSlotForWinningOutcome(outcome)
+    if not outcome or not GetNumLootItems or not GetLootSlotLink then
+        return nil
+    end
+
+    local lootCount = tonumber(GetNumLootItems()) or 0
+    if lootCount <= 0 then
+        return nil
+    end
+
+    local targetLink = tostring(outcome.itemLink or "")
+    local targetItemId = ExtractItemID(targetLink)
+    local targetText = NormalizeAnnouncementItemText(targetLink)
+    local slot
+    for slot = 1, lootCount do
+        local lootLink = GetLootSlotLink(slot)
+        if lootLink and lootLink ~= "" then
+            if targetItemId and ExtractItemID(lootLink) == targetItemId then
+                return slot
+            end
+            if targetLink ~= "" and lootLink == targetLink then
+                return slot
+            end
+            if targetText ~= "" and NormalizeAnnouncementItemText(lootLink) == targetText then
+                return slot
+            end
+        end
+    end
+
+    return nil
+end
+
+local function FindMasterLootCandidateIndex(slotId, winnerName)
+    if not slotId or not GetMasterLootCandidate then
+        return nil, nil
+    end
+
+    local normalizedWinnerName = string.lower(NormalizeBidderName(winnerName))
+    if normalizedWinnerName == "" then
+        return nil, nil
+    end
+
+    local maxCandidates = 40
+    local candidates = {}
+    local seenCandidates = {}
+    local exactIndex = nil
+    local looseIndex = nil
+
+    local function registerCandidate(candidateName, winnerLower, indexValue)
+        local normalizedCandidateText = NormalizeBidderName(candidateName)
+        local normalizedCandidateName = string.lower(normalizedCandidateText)
+        if normalizedCandidateName ~= "" and not seenCandidates[normalizedCandidateName] then
+            seenCandidates[normalizedCandidateName] = true
+            table.insert(candidates, tostring(normalizedCandidateText))
+        end
+        if normalizedCandidateName == winnerLower then
+            return "exact"
+        end
+        if string.find(normalizedCandidateName, winnerLower, 1, true) or string.find(winnerLower, normalizedCandidateName, 1, true) then
+            if not looseIndex then
+                looseIndex = indexValue
+            end
+        end
+        return nil
+    end
+
+    local index
+    for index = 0, maxCandidates do
+        local bySlotName = nil
+        local okBySlot, resultBySlot = pcall(GetMasterLootCandidate, slotId, index)
+        if okBySlot and resultBySlot and resultBySlot ~= "" then
+            bySlotName = tostring(resultBySlot)
+        end
+
+        local byIndexName = nil
+        local okByIndex, resultByIndex = pcall(GetMasterLootCandidate, index)
+        if okByIndex and resultByIndex and resultByIndex ~= "" then
+            byIndexName = tostring(resultByIndex)
+        end
+
+        if bySlotName then
+            if registerCandidate(bySlotName, normalizedWinnerName, index) == "exact" then
+                exactIndex = index
+                break
+            end
+        end
+
+        if byIndexName then
+            if registerCandidate(byIndexName, normalizedWinnerName, index) == "exact" then
+                exactIndex = index
+                break
+            end
+        end
+    end
+
+    if exactIndex then
+        return exactIndex, candidates
+    end
+    if looseIndex then
+        return looseIndex, candidates
+    end
+
+    return nil, candidates
+end
+
+local function DistributeWinnerLoot(outcome)
+    if not outcome then
+        return false, "No winner is pending for distribution."
+    end
+    if outcome.isTie then
+        return false, "Cannot distribute loot automatically for a tie."
+    end
+    if not IsPlayerMasterLooter() then
+        return false, "Only the Master Looter can distribute the item."
+    end
+    if not GiveMasterLoot then
+        return false, "Master Loot distribution API is not available."
+    end
+
+    local slotId = FindLootSlotForWinningOutcome(outcome)
+    if not slotId then
+        return false, "Could not find the winning item in the open loot window."
+    end
+
+    local candidateIndex, candidates = FindMasterLootCandidateIndex(slotId, outcome.winnerName)
+    if not candidateIndex then
+        local candidateText = ""
+        if candidates and table.getn(candidates) > 0 then
+            candidateText = " Available candidates: " .. table.concat(candidates, ", ")
+        else
+            candidateText = " No candidates were returned for this loot slot."
+        end
+        return false, "Could not find " .. tostring(outcome.winnerName) .. " in the Master Loot candidate list." .. candidateText
+    end
+
+    local ok = pcall(GiveMasterLoot, slotId, candidateIndex)
+    if not ok then
+        return false, "GiveMasterLoot failed for " .. tostring(outcome.winnerName) .. "."
+    end
+
+    return true, nil
+end
+
+local function FinalizeWinnerAnnouncementDecision(clearWinner)
+    lfbid_pendingWinnerAnnouncement = clearWinner and nil or lfbid_pendingWinnerAnnouncement
+    lfbid_manualWinnerSelectionActive = false
+    if RefreshLFBidBidList and lfbid_windowOpen then
+        RefreshLFBidBidList()
+    end
+end
+
 local function EnsureWinnerConfirmPopupRegistered()
     StaticPopupDialogs = StaticPopupDialogs or {}
     if StaticPopupDialogs["LFBID_CONFIRM_WINNER_ANNOUNCE"] then
@@ -1255,15 +1431,92 @@ local function EnsureWinnerConfirmPopupRegistered()
         text = "%s",
         button1 = "Yes",
         button2 = "No",
+        OnShow = function(popupFrame)
+            local frame = popupFrame or this
+            if not frame then
+                return
+            end
+
+            if not frame.lfbidBaseHeight then
+                frame.lfbidBaseHeight = frame:GetHeight()
+                frame.lfbidBaseWidth = frame:GetWidth()
+            end
+
+            local function ApplyWinnerPopupLayout(targetFrame)
+                if not targetFrame then
+                    return
+                end
+
+                targetFrame:SetHeight((targetFrame.lfbidBaseHeight or 0) + 46)
+                if targetFrame.lfbidBaseWidth then
+                    targetFrame:SetWidth(targetFrame.lfbidBaseWidth + 12)
+                end
+
+                if targetFrame.text then
+                    targetFrame.text:ClearAllPoints()
+                    targetFrame.text:SetPoint("TOP", targetFrame, "TOP", 0, -18)
+                    if targetFrame.text.SetWidth then
+                        targetFrame.text:SetWidth(280)
+                    end
+                end
+
+                if targetFrame.button1 and targetFrame.button2 then
+                    targetFrame.button1:ClearAllPoints()
+                    targetFrame.button1:SetPoint("BOTTOM", targetFrame, "BOTTOM", -63, 52)
+                    targetFrame.button2:ClearAllPoints()
+                    targetFrame.button2:SetPoint("BOTTOM", targetFrame, "BOTTOM", 63, 52)
+                end
+
+                if targetFrame.lfbidDistributeButton then
+                    targetFrame.lfbidDistributeButton:ClearAllPoints()
+                    targetFrame.lfbidDistributeButton:SetPoint("BOTTOM", targetFrame, "BOTTOM", 0, 24)
+                    targetFrame.lfbidDistributeButton:Show()
+                end
+            end
+
+            if not frame.lfbidDistributeButton then
+                frame.lfbidDistributeButton = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+                frame.lfbidDistributeButton:SetWidth(140)
+                frame.lfbidDistributeButton:SetHeight(22)
+                frame.lfbidDistributeButton:SetText("Yes & Distribute")
+                frame.lfbidDistributeButton:SetScript("OnClick", function()
+                    local outcome = lfbid_pendingWinnerAnnouncement
+                    local success, failureReason = DistributeWinnerLoot(outcome)
+                    if success then
+                        if outcome then
+                            SendWinnerAnnouncement(outcome)
+                        end
+                        print("LFBid: Distributed loot to " .. tostring(outcome and outcome.winnerName or "winner") .. ".")
+                        FinalizeWinnerAnnouncementDecision(true)
+                        if this and this.GetParent then
+                            this:GetParent():Hide()
+                        end
+                    elseif failureReason and failureReason ~= "" then
+                        print("LFBid: " .. failureReason)
+                    end
+                end)
+            end
+
+            ApplyWinnerPopupLayout(frame)
+
+            -- StaticPopup can resize itself after OnShow; apply layout again next frame.
+            frame:SetScript("OnUpdate", function()
+                ApplyWinnerPopupLayout(this)
+                this:SetScript("OnUpdate", nil)
+            end)
+
+            local outcome = lfbid_pendingWinnerAnnouncement
+            if outcome and not outcome.isTie and tostring(outcome.winnerName or "") ~= "" then
+                frame.lfbidDistributeButton:Enable()
+            else
+                frame.lfbidDistributeButton:Disable()
+            end
+        end,
         OnAccept = function()
             if lfbid_pendingWinnerAnnouncement then
                 SendWinnerAnnouncement(lfbid_pendingWinnerAnnouncement)
             end
-            lfbid_pendingWinnerAnnouncement = nil
-            lfbid_manualWinnerSelectionActive = false
-            if RefreshLFBidBidList and lfbid_windowOpen then
-                RefreshLFBidBidList()
-            end
+            FinalizeWinnerAnnouncementDecision(true)
         end,
         OnCancel = function()
             lfbid_pendingWinnerAnnouncement = nil
@@ -1273,6 +1526,18 @@ local function EnsureWinnerConfirmPopupRegistered()
             end
             if RefreshLFBidBidList and lfbid_windowOpen then
                 RefreshLFBidBidList()
+            end
+        end,
+        OnHide = function(popupFrame)
+            local frame = popupFrame or this
+            if frame and frame.lfbidDistributeButton then
+                frame.lfbidDistributeButton:Hide()
+            end
+            if frame and frame.lfbidBaseHeight then
+                frame:SetHeight(frame.lfbidBaseHeight)
+            end
+            if frame and frame.lfbidBaseWidth then
+                frame:SetWidth(frame.lfbidBaseWidth)
             end
         end,
         timeout = 0,
